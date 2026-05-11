@@ -91,9 +91,21 @@ app.post("/sync-menu", async (req, res) => {
 ========================= */
 app.post("/send-order", async (req, res) => {
   try {
-    if (req.body.secret !== API_KEY) {
-      return res.status(403).json({ error: "unauthorized" });
+
+    const { token } = req.body;
+
+    if (!token) {
+      return res.status(401).json({
+        error: "Utente non autenticato"
+      });
     }
+
+    const decoded = await appbaseApp
+      .auth()
+      .verifyIdToken(token);
+
+    console.log("UID:", decoded.uid);
+    console.log("EMAIL:", decoded.email);
 
     const {
       localeId,
@@ -103,24 +115,34 @@ app.post("/send-order", async (req, res) => {
       metodoPagamento,
       timestamp
     } = req.body;
-    if (!localeId) {
-  return res.status(400).json({ error: "localeId mancante" });
-}
 
-if (!Array.isArray(prodotti) || prodotti.length === 0) {
-  return res.status(400).json({ error: "prodotti mancanti" });
-}
+    if (!localeId) {
+      return res.status(400).json({
+        error: "localeId mancante"
+      });
+    }
+
+    if (!Array.isArray(prodotti) || prodotti.length === 0) {
+      return res.status(400).json({
+        error: "prodotti mancanti"
+      });
+    }
 
     await demasDb
       .collection("bars")
       .doc(localeId)
       .collection("ordini")
       .add({
+        uid: decoded.uid,
+        email: decoded.email || null,
+
         tavolo,
         prodotti,
         totale,
         metodoPagamento,
+
         timestamp: timestamp || Date.now(),
+
         status: "nuovo",
         source: "appbase"
       });
@@ -128,8 +150,11 @@ if (!Array.isArray(prodotti) || prodotti.length === 0) {
     res.json({ success: true });
 
   } catch (err) {
+
     console.error(err);
-    res.status(500).json({ error: "server error" });
+return res.status(403).json({
+  error: "token non valido"
+});
   }
 });
 
