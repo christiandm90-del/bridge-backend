@@ -133,14 +133,25 @@ const userData = userDoc.data() || {};
       });
     }
 
+const now = new Date();
 
-    const now = new Date();
+const formatter = new Intl.DateTimeFormat("it-IT", {
+  timeZone: "Europe/Rome",
+  day: "2-digit",
+  month: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+});
 
-const giorno = String(now.getDate()).padStart(2, "0");
-const mese = String(now.getMonth() + 1).padStart(2, "0");
+const parts = formatter.formatToParts(now);
 
-const ora = String(now.getHours()).padStart(2, "0");
-const minuti = String(now.getMinutes()).padStart(2, "0");
+const get = (type) =>
+  parts.find(p => p.type === type)?.value || "00";
+
+const giorno = get("day");
+const mese = get("month");
+const ora = get("hour");
+const minuti = get("minute");
 
 const emailSafe = String(decoded.email || "utente")
   .replace(/[@.]/g, "-")
