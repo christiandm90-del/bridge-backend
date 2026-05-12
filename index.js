@@ -104,8 +104,13 @@ app.post("/send-order", async (req, res) => {
       .auth()
       .verifyIdToken(token);
 
-    console.log("UID:", decoded.uid);
-    console.log("EMAIL:", decoded.email);
+
+    const userDoc = await appbaseDb
+  .collection("users")
+  .doc(decoded.uid)
+  .get();
+
+const userData = userDoc.data() || {};
 
     const {
       localeId,
@@ -128,24 +133,31 @@ app.post("/send-order", async (req, res) => {
       });
     }
 
-    await demasDb
-      .collection("bars")
-      .doc(localeId)
-      .collection("ordini")
-      .add({
-        uid: decoded.uid,
-        email: decoded.email || null,
+await demasDb
+  .collection("bars")
+  .doc(localeId)
+  .collection("ordini")
+  .add({
 
-        tavolo,
-        prodotti,
-        totale,
-        metodoPagamento,
+cliente: {
+  uid: decoded.uid,
+  email: String(decoded.email || "").slice(0, 120),
+  nome: String(userData.ownerName || "").slice(0, 80),
+  telefono: String(userData.phone || "").slice(0, 30),
+},
 
-        timestamp: timestamp || Date.now(),
+    tavolo,
+    prodotti,
+    totale,
+    metodoPagamento,
 
-        status: "nuovo",
-        source: "appbase"
-      });
+    timestamp: timestamp || Date.now(),
+
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    
+    status: "nuovo",
+    source: "appbase"
+  });
 
     res.json({ success: true });
 
