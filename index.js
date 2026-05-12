@@ -133,12 +133,33 @@ const userData = userDoc.data() || {};
       });
     }
 
+
+    const now = new Date();
+
+const giorno = String(now.getDate()).padStart(2, "0");
+const mese = String(now.getMonth() + 1).padStart(2, "0");
+
+const ora = String(now.getHours()).padStart(2, "0");
+const minuti = String(now.getMinutes()).padStart(2, "0");
+
+const emailSafe = String(decoded.email || "utente")
+  .replace(/[@.]/g, "-")
+  .slice(0, 40);
+
+const randomId = Math.random()
+  .toString(36)
+  .substring(2, 8)
+  .toUpperCase();
+
+const ordineId =
+  `${giorno}-${mese}_${ora}-${minuti}_${emailSafe}_${randomId}`;
+
 await demasDb
   .collection("bars")
   .doc(localeId)
-  .collection("ordini")
-  .add({
-
+.collection("ordini")
+.doc(ordineId)
+.set({
 cliente: {
   uid: decoded.uid,
   email: String(decoded.email || "").slice(0, 120),
@@ -154,7 +175,7 @@ cliente: {
     timestamp: timestamp || Date.now(),
 
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    
+
     status: "nuovo",
     source: "appbase"
   });
