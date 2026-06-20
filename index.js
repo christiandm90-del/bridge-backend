@@ -89,6 +89,23 @@ app.post("/sync-menu", async (req, res) => {
 /* =========================
    SEND ORDER (APPBASE → DEMAS)
 ========================= */
+/* =========================
+   HELPER: distanza in metri tra due coordinate (haversine)
+========================= */
+function distanzaMetri(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/* =========================
+   SEND ORDER (APPBASE → DEMAS)
+========================= */
 app.post("/send-order", async (req, res) => {
   try {
 
@@ -118,7 +135,12 @@ const userData = userDoc.data() || {};
       prodotti,
       totale,
       metodoPagamento,
-      timestamp
+      timestamp,
+      tableId,      // NUOVO: id numerico del tavolo scansionato, opzionale
+      sessionToken, // NUOVO: token letto dal QR del tavolo, opzionale
+      guestName,    // NUOVO: nome inserito dal cliente ospite, opzionale
+      lat,          // NUOVO: posizione cliente, opzionale
+      lng,          // NUOVO
     } = req.body;
 
     if (!localeId) {
@@ -131,6 +153,70 @@ const userData = userDoc.data() || {};
       return res.status(400).json({
         error: "prodotti mancanti"
       });
+    }
+
+    /* =========================
+       NUOVO: risoluzione tavolo + verifica sessione + geofence
+    ========================= */
+    let tavoloRisolto = tavolo || "";
+    let noteCliente = null;
+    let daVerificare = false;
+
+    if (tableId != null) {
+      noteCliente = tavolo || null; // eventuale testo libero diventa nota, non sostituisce il nome tavolo
+      daVerificare = true; // di default sospetto, lo validiamo sotto
+
+      try {
+        const sessioneSnap = await demasDb
+          .collection("bars").doc(localeId)
+          .collection("sessioniTavolo").doc(String(tableId))
+          .get();
+
+        if (sessioneSnap.exists) {
+          const sessione = sessioneSnap.data();
+          const ora = Date.now();
+          const sessioneValida =
+            sessione.attivo === true &&
+            sessione.token === sessionToken &&
+            (sessione.scadeAt == null || sessione.scadeAt > ora);
+
+          if (sessioneValida) {
+            daVerificare = false;
+
+            // Geofence: solo se il locale ha coordinate configurate
+            const localeSnap = await demasDb
+              .collection("bars").doc(localeId)
+              .collection("meta").doc("locale")
+              .get();
+
+            if (localeSnap.exists) {
+              const localeData = localeSnap.data();
+              if (
+                typeof localeData.lat === "number" &&
+                typeof localeData.lng === "number" &&
+                typeof lat === "number" &&
+                typeof lng === "number"
+              ) {
+                const raggio = localeData.raggioMetri || 150;
+                const distanza = distanzaMetri(lat, lng, localeData.lat, localeData.lng);
+                if (distanza > raggio) daVerificare = true;
+              }
+            }
+          }
+        }
+
+        // Nome reale del tavolo, per mostrarlo correttamente in DEMAS
+        const tavoloSnap = await demasDb
+          .collection("bars").doc(localeId)
+          .collection("tavoli").doc(String(tableId))
+          .get();
+        if (tavoloSnap.exists) {
+          tavoloRisolto = tavoloSnap.data().nome || `Tavolo ${tableId}`;
+        }
+      } catch (err) {
+        console.error("Errore validazione sessione tavolo:", err);
+        daVerificare = true; // in dubbio, manda comunque a verifica invece di rifiutare
+      }
     }
 
 const now = new Date();
@@ -174,11 +260,14 @@ await demasDb
 cliente: {
   uid: decoded.uid,
   email: String(decoded.email || "").slice(0, 120),
-  nome: String(userData.ownerName || "").slice(0, 80),
+  nome: String(guestName || userData.ownerName || "").slice(0, 80),
   telefono: String(userData.phone || "").slice(0, 30),
 },
 
-    tavolo,
+    tavolo: tavoloRisolto,
+    note: noteCliente,
+    tableId: tableId ?? null,
+    daVerificare,
     prodotti,
     totale,
     metodoPagamento,
