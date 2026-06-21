@@ -1,15 +1,19 @@
 const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
+const Stripe = require("stripe");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Stripe inizializzato con chiave segreta da env
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+
 const API_KEY = process.env.BRIDGE_SECRET;
 
 /* =========================
-   🔥 FIREBASE APPBASE (GIÀ ESISTENTE SU RENDER)
+   🔥 FIREBASE APPBASE
 ========================= */
 const appbaseServiceAccount = {
   project_id: process.env.FIREBASE_PROJECT_ID,
@@ -20,7 +24,7 @@ const appbaseServiceAccount = {
 };
 
 /* =========================
-   🔥 FIREBASE DEMAS (NUOVO SU RENDER)
+   🔥 FIREBASE DEMAS
 ========================= */
 const demasServiceAccount = {
   project_id: process.env.DEMAS_FIREBASE_PROJECT_ID,
@@ -67,7 +71,7 @@ app.post("/sync-menu", async (req, res) => {
       companyName,
       categorie = [],
       sottocategorie = [],
-      prodotti = []
+      prodotti = [],
     } = req.body;
 
     await appbaseDb.collection("publicMenus").doc(localeId).set({
@@ -79,7 +83,6 @@ app.post("/sync-menu", async (req, res) => {
     });
 
     res.json({ success: true });
-
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "server error" });
@@ -87,13 +90,7 @@ app.post("/sync-menu", async (req, res) => {
 });
 
 /* =========================
-   SEND ORDER (APPBASE → DEMAS)
-========================= */
-/* =========================
-   HELPER: distanza in metri tra due coordinate (haversine)
-========================= */
-/* =========================
-   HELPER: distanza in metri tra due coordinate (haversine)
+   HELPER: distanza in metri (haversine)
 ========================= */
 function distanzaMetri(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -107,30 +104,68 @@ function distanzaMetri(lat1, lon1, lat2, lon2) {
 }
 
 /* =========================
+   CREATE PAYMENT INTENT (Stripe)
+   POST /create-payment-intent
+   Body: { token, totale, localeId }
+   Returns: { clientSecret }
+========================= */
+app.post("/create-payment-intent", async (req, res) => {
+  try {
+    const { token, totale, localeId } = req.body;
+
+    // Verifica utente autenticato
+    if (!token) {
+      return res.status(401).json({ error: "Utente non autenticato" });
+    }
+
+    const decoded = await appbaseApp.auth().verifyIdToken(token);
+
+    if (!localeId) {
+      return res.status(400).json({ error: "localeId mancante" });
+    }
+
+    // totale in euro → Stripe vuole centesimi (intero)
+    const importoCentesimi = Math.round(Number(totale) * 100);
+
+    if (!importoCentesimi || importoCentesimi < 50) {
+      // Stripe richiede minimo 0.50€
+      return res.status(400).json({ error: "Importo non valido (minimo 0.50€)" });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: importoCentesimi,
+      currency: "eur",
+      // Stripe seleziona automaticamente i metodi abilitati nella dashboard
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        localeId,
+        uid: decoded.uid,
+        email: decoded.email || "",
+      },
+    });
+
+    res.json({ clientSecret: paymentIntent.client_secret });
+  } catch (err) {
+    console.error("❌ Stripe error:", err);
+    res.status(500).json({ error: "Errore creazione pagamento" });
+  }
+});
+
+/* =========================
    SEND ORDER (APPBASE → DEMAS)
 ========================= */
 app.post("/send-order", async (req, res) => {
   try {
-
     const { token } = req.body;
 
     if (!token) {
-      return res.status(401).json({
-        error: "Utente non autenticato"
-      });
+      return res.status(401).json({ error: "Utente non autenticato" });
     }
 
-    const decoded = await appbaseApp
-      .auth()
-      .verifyIdToken(token);
+    const decoded = await appbaseApp.auth().verifyIdToken(token);
 
-
-    const userDoc = await appbaseDb
-  .collection("users")
-  .doc(decoded.uid)
-  .get();
-
-const userData = userDoc.data() || {};
+    const userDoc = await appbaseDb.collection("users").doc(decoded.uid).get();
+    const userData = userDoc.data() || {};
 
     const {
       localeId,
@@ -144,25 +179,29 @@ const userData = userDoc.data() || {};
       guestName,
       lat,
       lng,
+      stripePaymentIntentId, // opzionale: passato dal frontend dopo pagamento confermato
     } = req.body;
 
     if (!localeId) {
-      return res.status(400).json({
-        error: "localeId mancante"
-      });
+      return res.status(400).json({ error: "localeId mancante" });
     }
 
     if (!Array.isArray(prodotti) || prodotti.length === 0) {
-      return res.status(400).json({
-        error: "prodotti mancanti"
-      });
+      return res.status(400).json({ error: "prodotti mancanti" });
     }
 
-    /* =========================
-       Risoluzione tavolo + verifica sessione + geofence
-       - token non valido/scaduto/inesistente → caso "duro": spam, non ambiguo
-       - solo geofence fuori raggio (token valido) → caso ambiguo: daVerificare
-    ========================= */
+    // Se il metodo è "carta" verifica che il PaymentIntent sia confermato
+    if (metodoPagamento === "carta") {
+      if (!stripePaymentIntentId) {
+        return res.status(400).json({ error: "Pagamento non completato" });
+      }
+      const intent = await stripe.paymentIntents.retrieve(stripePaymentIntentId);
+      if (intent.status !== "succeeded") {
+        return res.status(402).json({ error: "Pagamento non confermato da Stripe" });
+      }
+    }
+
+    /* ── Risoluzione tavolo + verifica sessione + geofence ── */
     let tavoloRisolto = tavolo || "";
     let noteCliente = null;
     let daVerificare = false;
@@ -219,89 +258,61 @@ const userData = userDoc.data() || {};
         }
       } catch (err) {
         console.error("Errore validazione sessione tavolo:", err);
-        daVerificare = true; // in dubbio, verifica manuale, non spam
+        daVerificare = true;
       }
     }
 
-const now = new Date();
+    /* ── Genera ordineId ── */
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat("it-IT", {
+      timeZone: "Europe/Rome",
+      day: "2-digit", month: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    });
+    const parts = formatter.formatToParts(now);
+    const get = (type) => parts.find((p) => p.type === type)?.value || "00";
+    const ordineId = `${get("day")}-${get("month")}_${get("hour")}-${get("minute")}_${
+      String(decoded.email || "utente").replace(/[@.]/g, "-").slice(0, 40)
+    }_${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
-const formatter = new Intl.DateTimeFormat("it-IT", {
-  timeZone: "Europe/Rome",
-  day: "2-digit",
-  month: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-});
-
-const parts = formatter.formatToParts(now);
-
-const get = (type) =>
-  parts.find(p => p.type === type)?.value || "00";
-
-const giorno = get("day");
-const mese = get("month");
-const ora = get("hour");
-const minuti = get("minute");
-
-const emailSafe = String(decoded.email || "utente")
-  .replace(/[@.]/g, "-")
-  .slice(0, 40);
-
-const randomId = Math.random()
-  .toString(36)
-  .substring(2, 8)
-  .toUpperCase();
-
-const ordineId =
-  `${giorno}-${mese}_${ora}-${minuti}_${emailSafe}_${randomId}`;
-
-await demasDb
-  .collection("bars")
-  .doc(localeId)
-.collection("ordini")
-.doc(ordineId)
-.set({
-cliente: {
-  uid: decoded.uid,
-  email: String(decoded.email || "").slice(0, 120),
-  nome: String(guestName || userData.ownerName || "").slice(0, 80),
-  telefono: String(userData.phone || "").slice(0, 30),
-},
-
-    tavolo: tavoloRisolto,
-    note: noteCliente,
-    tableId: tableId ?? null,
-    daVerificare,
-    spam,
-    prodotti,
-    totale,
-    metodoPagamento,
-
-    timestamp: timestamp || Date.now(),
-
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-
-    status: "nuovo",
-    source: "appbase"
-  });
+    await demasDb
+      .collection("bars").doc(localeId)
+      .collection("ordini").doc(ordineId)
+      .set({
+        cliente: {
+          uid: decoded.uid,
+          email: String(decoded.email || "").slice(0, 120),
+          nome: String(guestName || userData.ownerName || "").slice(0, 80),
+          telefono: String(userData.phone || "").slice(0, 30),
+        },
+        tavolo: tavoloRisolto,
+        note: noteCliente,
+        tableId: tableId ?? null,
+        daVerificare,
+        spam,
+        prodotti,
+        totale,
+        metodoPagamento,
+        // traccia il pagamento Stripe se presente
+        stripePaymentIntentId: stripePaymentIntentId || null,
+        timestamp: timestamp || Date.now(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: "nuovo",
+        source: "appbase",
+      });
 
     if (spam) {
-      return res.status(409).json({
-        error: "sessione_non_valida",
-        scollega: true
-      });
+      return res.status(409).json({ error: "sessione_non_valida", scollega: true });
     }
 
     res.json({ success: true });
-
   } catch (err) {
-
     console.error(err);
-return res.status(403).json({
-  error: "token non valido"
-});
+    return res.status(403).json({ error: "token non valido" });
   }
 });
+
+
 {/* prev: *app.post("/send-order", async (req, res) => {
   try {
 
@@ -414,7 +425,6 @@ return res.status(403).json({
 });
   }
 }); */}
-
 /* =========================
    START
 ========================= */
