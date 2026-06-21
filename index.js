@@ -102,7 +102,31 @@ function distanzaMetri(lat1, lon1, lat2, lon2) {
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
+/* =========================
+   HELPER: verifica prodotti contro il menu reale, ricalcola prezzi/totale
+   server-side — non ci si fida mai dei prezzi inviati dal client
+========================= */
+async function verificaEcorreggiProdotti(localeId, prodottiClient) {
+  const menuSnap = await appbaseDb.collection("publicMenus").doc(localeId).get();
+  if (!menuSnap.exists) return null;
 
+  const menuProdotti = menuSnap.data().prodotti || [];
+  const mappaPrezzi = new Map();
+  menuProdotti.forEach((p) => {
+    if (p && p.nome) mappaPrezzi.set(String(p.nome).trim().toLowerCase(), Number(p.prezzo) || 0);
+  });
+
+  const prodottiCorretti = [];
+  for (const item of prodottiClient) {
+    const chiave = String(item?.nome || "").trim().toLowerCase();
+    const prezzoReale = mappaPrezzi.get(chiave);
+    if (prezzoReale == null) return null; // prodotto non in menu: sospetto, rifiuta
+    prodottiCorretti.push({ ...item, prezzo: prezzoReale });
+  }
+
+  const totale = Math.round(prodottiCorretti.reduce((s, p) => s + p.prezzo, 0) * 100) / 100;
+  return { prodotti: prodottiCorretti, totale };
+}
 /* =========================
    CREATE PAYMENT INTENT (Stripe)
    POST /create-payment-intent
@@ -111,9 +135,8 @@ function distanzaMetri(lat1, lon1, lat2, lon2) {
 ========================= */
 app.post("/create-payment-intent", async (req, res) => {
   try {
-    const { token, totale, localeId } = req.body;
+    const { token, prodotti, localeId } = req.body;
 
-    // Verifica utente autenticato
     if (!token) {
       return res.status(401).json({ error: "Utente non autenticato" });
     }
@@ -123,28 +146,28 @@ app.post("/create-payment-intent", async (req, res) => {
     if (!localeId) {
       return res.status(400).json({ error: "localeId mancante" });
     }
+    if (!Array.isArray(prodotti) || prodotti.length === 0) {
+      return res.status(400).json({ error: "prodotti mancanti" });
+    }
 
-    // totale in euro → Stripe vuole centesimi (intero)
-    const importoCentesimi = Math.round(Number(totale) * 100);
+    const verificato = await verificaEcorreggiProdotti(localeId, prodotti);
+    if (!verificato) {
+      return res.status(400).json({ error: "Prodotti non riconosciuti nel menu" });
+    }
 
+    const importoCentesimi = Math.round(verificato.totale * 100);
     if (!importoCentesimi || importoCentesimi < 50) {
-      // Stripe richiede minimo 0.50€
       return res.status(400).json({ error: "Importo non valido (minimo 0.50€)" });
     }
 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: importoCentesimi,
       currency: "eur",
-      // Stripe seleziona automaticamente i metodi abilitati nella dashboard
       automatic_payment_methods: { enabled: true },
-      metadata: {
-        localeId,
-        uid: decoded.uid,
-        email: decoded.email || "",
-      },
+      metadata: { localeId, uid: decoded.uid, email: decoded.email || "" },
     });
 
-    res.json({ clientSecret: paymentIntent.client_secret });
+    res.json({ clientSecret: paymentIntent.client_secret, totaleVerificato: verificato.totale });
   } catch (err) {
     console.error("❌ Stripe error:", err);
     res.status(500).json({ error: "Errore creazione pagamento" });
@@ -155,6 +178,169 @@ app.post("/create-payment-intent", async (req, res) => {
    SEND ORDER (APPBASE → DEMAS)
 ========================= */
 app.post("/send-order", async (req, res) => {
+  try {
+    const { token } = req.body;
+
+    if (!token) {
+      return res.status(401).json({ error: "Utente non autenticato" });
+    }
+
+    const decoded = await appbaseApp.auth().verifyIdToken(token);
+
+    const userDoc = await appbaseDb.collection("users").doc(decoded.uid).get();
+    const userData = userDoc.data() || {};
+
+    const {
+      localeId, tavolo, prodotti, metodoPagamento, timestamp,
+      tableId, sessionToken, guestName, lat, lng, stripePaymentIntentId,
+    } = req.body;
+
+    if (!localeId) {
+      return res.status(400).json({ error: "localeId mancante" });
+    }
+    if (!Array.isArray(prodotti) || prodotti.length === 0) {
+      return res.status(400).json({ error: "prodotti mancanti" });
+    }
+
+    // Non ci fidiamo mai di prezzi/totale dal client: ricalcoliamo dal menu reale
+    const verificato = await verificaEcorreggiProdotti(localeId, prodotti);
+    if (!verificato) {
+      return res.status(400).json({ error: "Prodotti non riconosciuti nel menu" });
+    }
+    const prodottiVerificati = verificato.prodotti;
+    const totaleVerificato = verificato.totale;
+
+    let pagamentoVerificato = false;
+    if (metodoPagamento === "Paga con carta") {
+      if (!stripePaymentIntentId) {
+        console.error("❌ carta: stripePaymentIntentId mancante nel body");
+        return res.status(400).json({ error: "Pagamento non completato" });
+      }
+      try {
+        const intent = await stripe.paymentIntents.retrieve(stripePaymentIntentId);
+        if (intent.status !== "succeeded") {
+          console.error("⚠️ PaymentIntent non succeeded:", stripePaymentIntentId, "status:", intent.status);
+          return res.status(402).json({ error: "Pagamento non confermato da Stripe", status: intent.status });
+        }
+        const importoAtteso = Math.round(totaleVerificato * 100);
+        if (intent.amount !== importoAtteso) {
+          console.error("⚠️ Importo Stripe non corrisponde:", intent.amount, "atteso:", importoAtteso);
+          return res.status(402).json({ error: "Importo pagamento non corrispondente" });
+        }
+        pagamentoVerificato = true;
+      } catch (stripeErr) {
+        console.error("❌ Errore verifica Stripe:", stripeErr.message, "id ricevuto:", stripePaymentIntentId);
+        return res.status(402).json({ error: "Errore verifica pagamento Stripe" });
+      }
+    }
+
+    let tavoloRisolto = tavolo || "";
+    let noteCliente = null;
+    let daVerificare = false;
+    let spam = false;
+
+    if (tableId != null) {
+      noteCliente = tavolo || null;
+      try {
+        const sessioneSnap = await demasDb
+          .collection("bars").doc(localeId)
+          .collection("sessioniTavolo").doc(String(tableId))
+          .get();
+
+        let sessioneValida = false;
+        if (sessioneSnap.exists) {
+          const sessione = sessioneSnap.data();
+          const ora = Date.now();
+          sessioneValida =
+            sessione.attivo === true &&
+            sessione.token === sessionToken &&
+            (sessione.scadeAt == null || sessione.scadeAt > ora);
+        }
+
+        if (!sessioneValida) {
+          spam = true;
+        } else {
+          const localeSnap = await demasDb
+            .collection("bars").doc(localeId)
+            .collection("meta").doc("locale")
+            .get();
+
+          if (localeSnap.exists) {
+            const localeData = localeSnap.data();
+            if (
+              typeof localeData.lat === "number" &&
+              typeof localeData.lng === "number" &&
+              typeof lat === "number" &&
+              typeof lng === "number"
+            ) {
+              const raggio = localeData.raggioMetri || 150;
+              const distanza = distanzaMetri(lat, lng, localeData.lat, localeData.lng);
+              if (distanza > raggio) daVerificare = true;
+            }
+          }
+        }
+
+        const tavoloSnap = await demasDb
+          .collection("bars").doc(localeId)
+          .collection("tavoli").doc(String(tableId))
+          .get();
+        if (tavoloSnap.exists) {
+          tavoloRisolto = tavoloSnap.data().nome || `Tavolo ${tableId}`;
+        }
+      } catch (err) {
+        console.error("Errore validazione sessione tavolo:", err);
+        daVerificare = true;
+      }
+    }
+
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat("it-IT", {
+      timeZone: "Europe/Rome", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+    });
+    const parts = formatter.formatToParts(now);
+    const get = (type) => parts.find((p) => p.type === type)?.value || "00";
+    const ordineId = `${get("day")}-${get("month")}_${get("hour")}-${get("minute")}_${
+      String(decoded.email || "utente").replace(/[@.]/g, "-").slice(0, 40)
+    }_${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+
+    await demasDb
+      .collection("bars").doc(localeId)
+      .collection("ordini").doc(ordineId)
+      .set({
+        cliente: {
+          uid: decoded.uid,
+          email: String(decoded.email || "").slice(0, 120),
+          nome: String(guestName || userData.ownerName || "").slice(0, 80),
+          telefono: String(userData.phone || "").slice(0, 30),
+        },
+        tavolo: tavoloRisolto,
+        note: noteCliente,
+        tableId: tableId ?? null,
+        daVerificare,
+        spam,
+        prodotti: prodottiVerificati,
+        totale: totaleVerificato,
+        metodoPagamento,
+        pagamentoVerificato,
+        stripePaymentIntentId: stripePaymentIntentId || null,
+        timestamp: timestamp || Date.now(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: "nuovo",
+        source: "appbase",
+      });
+
+    if (spam) {
+      return res.status(409).json({ error: "sessione_non_valida", scollega: true });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(403).json({ error: "token non valido" });
+  }
+});
+
+{/* app.post("/send-order", async (req, res) => {
   try {
     const { token } = req.body;
 
@@ -192,7 +378,7 @@ app.post("/send-order", async (req, res) => {
 
     // Se il metodo è "carta" verifica che il PaymentIntent sia confermato
   // Se il metodo è "carta" verifica che il PaymentIntent sia confermato
-    if (metodoPagamento === "carta") {
+    if (metodoPagamento === "Paga con carta") {
       if (!stripePaymentIntentId) {
         console.error("❌ carta: stripePaymentIntentId mancante nel body");
         return res.status(400).json({ error: "Pagamento non completato" });
@@ -209,7 +395,7 @@ app.post("/send-order", async (req, res) => {
       }
     }
 
-    /* ── Risoluzione tavolo + verifica sessione + geofence ── */
+    // ── Risoluzione tavolo + verifica sessione + geofence ── 
     let tavoloRisolto = tavolo || "";
     let noteCliente = null;
     let daVerificare = false;
@@ -270,7 +456,7 @@ app.post("/send-order", async (req, res) => {
       }
     }
 
-    /* ── Genera ordineId ── */
+    // ── Genera ordineId ── 
     const now = new Date();
     const formatter = new Intl.DateTimeFormat("it-IT", {
       timeZone: "Europe/Rome",
@@ -318,7 +504,8 @@ app.post("/send-order", async (req, res) => {
     console.error(err);
     return res.status(403).json({ error: "token non valido" });
   }
-});
+}); */}
+
 
 
 {/* prev: *app.post("/send-order", async (req, res) => {
