@@ -92,6 +92,9 @@ app.post("/sync-menu", async (req, res) => {
 /* =========================
    HELPER: distanza in metri tra due coordinate (haversine)
 ========================= */
+/* =========================
+   HELPER: distanza in metri tra due coordinate (haversine)
+========================= */
 function distanzaMetri(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const toRad = (d) => (d * Math.PI) / 180;
@@ -136,11 +139,11 @@ const userData = userDoc.data() || {};
       totale,
       metodoPagamento,
       timestamp,
-      tableId,      // NUOVO: id numerico del tavolo scansionato, opzionale
-      sessionToken, // NUOVO: token letto dal QR del tavolo, opzionale
-      guestName,    // NUOVO: nome inserito dal cliente ospite, opzionale
-      lat,          // NUOVO: posizione cliente, opzionale
-      lng,          // NUOVO
+      tableId,
+      sessionToken,
+      guestName,
+      lat,
+      lng,
     } = req.body;
 
     if (!localeId) {
@@ -156,15 +159,17 @@ const userData = userDoc.data() || {};
     }
 
     /* =========================
-       NUOVO: risoluzione tavolo + verifica sessione + geofence
+       Risoluzione tavolo + verifica sessione + geofence
+       - token non valido/scaduto/inesistente → caso "duro": spam, non ambiguo
+       - solo geofence fuori raggio (token valido) → caso ambiguo: daVerificare
     ========================= */
     let tavoloRisolto = tavolo || "";
     let noteCliente = null;
     let daVerificare = false;
+    let spam = false;
 
     if (tableId != null) {
-      noteCliente = tavolo || null; // eventuale testo libero diventa nota, non sostituisce il nome tavolo
-      daVerificare = true; // di default sospetto, lo validiamo sotto
+      noteCliente = tavolo || null;
 
       try {
         const sessioneSnap = await demasDb
@@ -172,40 +177,39 @@ const userData = userDoc.data() || {};
           .collection("sessioniTavolo").doc(String(tableId))
           .get();
 
+        let sessioneValida = false;
         if (sessioneSnap.exists) {
           const sessione = sessioneSnap.data();
           const ora = Date.now();
-          const sessioneValida =
+          sessioneValida =
             sessione.attivo === true &&
             sessione.token === sessionToken &&
             (sessione.scadeAt == null || sessione.scadeAt > ora);
+        }
 
-          if (sessioneValida) {
-            daVerificare = false;
+        if (!sessioneValida) {
+          spam = true;
+        } else {
+          const localeSnap = await demasDb
+            .collection("bars").doc(localeId)
+            .collection("meta").doc("locale")
+            .get();
 
-            // Geofence: solo se il locale ha coordinate configurate
-            const localeSnap = await demasDb
-              .collection("bars").doc(localeId)
-              .collection("meta").doc("locale")
-              .get();
-
-            if (localeSnap.exists) {
-              const localeData = localeSnap.data();
-              if (
-                typeof localeData.lat === "number" &&
-                typeof localeData.lng === "number" &&
-                typeof lat === "number" &&
-                typeof lng === "number"
-              ) {
-                const raggio = localeData.raggioMetri || 150;
-                const distanza = distanzaMetri(lat, lng, localeData.lat, localeData.lng);
-                if (distanza > raggio) daVerificare = true;
-              }
+          if (localeSnap.exists) {
+            const localeData = localeSnap.data();
+            if (
+              typeof localeData.lat === "number" &&
+              typeof localeData.lng === "number" &&
+              typeof lat === "number" &&
+              typeof lng === "number"
+            ) {
+              const raggio = localeData.raggioMetri || 150;
+              const distanza = distanzaMetri(lat, lng, localeData.lat, localeData.lng);
+              if (distanza > raggio) daVerificare = true;
             }
           }
         }
 
-        // Nome reale del tavolo, per mostrarlo correttamente in DEMAS
         const tavoloSnap = await demasDb
           .collection("bars").doc(localeId)
           .collection("tavoli").doc(String(tableId))
@@ -215,7 +219,7 @@ const userData = userDoc.data() || {};
         }
       } catch (err) {
         console.error("Errore validazione sessione tavolo:", err);
-        daVerificare = true; // in dubbio, manda comunque a verifica invece di rifiutare
+        daVerificare = true; // in dubbio, verifica manuale, non spam
       }
     }
 
@@ -268,6 +272,126 @@ cliente: {
     note: noteCliente,
     tableId: tableId ?? null,
     daVerificare,
+    spam,
+    prodotti,
+    totale,
+    metodoPagamento,
+
+    timestamp: timestamp || Date.now(),
+
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+
+    status: "nuovo",
+    source: "appbase"
+  });
+
+    if (spam) {
+      return res.status(409).json({
+        error: "sessione_non_valida",
+        scollega: true
+      });
+    }
+
+    res.json({ success: true });
+
+  } catch (err) {
+
+    console.error(err);
+return res.status(403).json({
+  error: "token non valido"
+});
+  }
+});
+{/* prev: *app.post("/send-order", async (req, res) => {
+  try {
+
+    const { token } = req.body;
+
+    if (!token) {
+      return res.status(401).json({
+        error: "Utente non autenticato"
+      });
+    }
+
+    const decoded = await appbaseApp
+      .auth()
+      .verifyIdToken(token);
+
+
+    const userDoc = await appbaseDb
+  .collection("users")
+  .doc(decoded.uid)
+  .get();
+
+const userData = userDoc.data() || {};
+
+    const {
+      localeId,
+      tavolo,
+      prodotti,
+      totale,
+      metodoPagamento,
+      timestamp
+    } = req.body;
+
+    if (!localeId) {
+      return res.status(400).json({
+        error: "localeId mancante"
+      });
+    }
+
+    if (!Array.isArray(prodotti) || prodotti.length === 0) {
+      return res.status(400).json({
+        error: "prodotti mancanti"
+      });
+    }
+
+const now = new Date();
+
+const formatter = new Intl.DateTimeFormat("it-IT", {
+  timeZone: "Europe/Rome",
+  day: "2-digit",
+  month: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+});
+
+const parts = formatter.formatToParts(now);
+
+const get = (type) =>
+  parts.find(p => p.type === type)?.value || "00";
+
+const giorno = get("day");
+const mese = get("month");
+const ora = get("hour");
+const minuti = get("minute");
+
+const emailSafe = String(decoded.email || "utente")
+  .replace(/[@.]/g, "-")
+  .slice(0, 40);
+
+const randomId = Math.random()
+  .toString(36)
+  .substring(2, 8)
+  .toUpperCase();
+
+const ordineId =
+  `${giorno}-${mese}_${ora}-${minuti}_${emailSafe}_${randomId}`;
+
+await demasDb
+  .collection("bars")
+  .doc(localeId)
+.collection("ordini")
+.doc(ordineId)
+.set({
+cliente: {
+  uid: decoded.uid,
+  email: String(decoded.email || "").slice(0, 120),
+  nome: String(userData.ownerName || "").slice(0, 80),
+  telefono: String(userData.phone || "").slice(0, 30),
+},
+
+    tavolo,
     prodotti,
     totale,
     metodoPagamento,
@@ -289,7 +413,7 @@ return res.status(403).json({
   error: "token non valido"
 });
   }
-});
+}); */}
 
 /* =========================
    START
