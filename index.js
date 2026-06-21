@@ -191,13 +191,21 @@ app.post("/send-order", async (req, res) => {
     }
 
     // Se il metodo è "carta" verifica che il PaymentIntent sia confermato
+  // Se il metodo è "carta" verifica che il PaymentIntent sia confermato
     if (metodoPagamento === "carta") {
       if (!stripePaymentIntentId) {
+        console.error("❌ carta: stripePaymentIntentId mancante nel body");
         return res.status(400).json({ error: "Pagamento non completato" });
       }
-      const intent = await stripe.paymentIntents.retrieve(stripePaymentIntentId);
-      if (intent.status !== "succeeded") {
-        return res.status(402).json({ error: "Pagamento non confermato da Stripe" });
+      try {
+        const intent = await stripe.paymentIntents.retrieve(stripePaymentIntentId);
+        if (intent.status !== "succeeded") {
+          console.error("⚠️ PaymentIntent non succeeded:", stripePaymentIntentId, "status:", intent.status);
+          return res.status(402).json({ error: "Pagamento non confermato da Stripe", status: intent.status });
+        }
+      } catch (stripeErr) {
+        console.error("❌ Errore verifica Stripe:", stripeErr.message, "id ricevuto:", stripePaymentIntentId);
+        return res.status(402).json({ error: "Errore verifica pagamento Stripe" });
       }
     }
 
