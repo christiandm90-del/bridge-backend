@@ -193,6 +193,7 @@ app.post("/send-order", async (req, res) => {
     const {
       localeId, tavolo, prodotti, metodoPagamento, timestamp,
       tableId, sessionToken, guestName, lat, lng, stripePaymentIntentId,
+      note, 
     } = req.body;
 
     if (!localeId) {
@@ -314,7 +315,7 @@ app.post("/send-order", async (req, res) => {
           telefono: String(userData.phone || "").slice(0, 30),
         },
         tavolo: tavoloRisolto,
-        note: noteCliente,
+       note: note || noteCliente || null,
         tableId: tableId ?? null,
         daVerificare,
         spam,
