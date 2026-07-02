@@ -72,6 +72,7 @@ app.post("/sync-menu", async (req, res) => {
       categorie = [],
       sottocategorie = [],
       prodotti = [],
+        publicMenus = null,  
     } = req.body;
 
     await appbaseDb.collection("publicMenus").doc(localeId).set({
@@ -79,6 +80,12 @@ app.post("/sync-menu", async (req, res) => {
       categorie,
       sottocategorie,
       prodotti,
+
+       orari: publicMenus?.orari || {},
+  chiusure: publicMenus?.chiusure || [],
+  offerte: publicMenus?.offerte || [],
+  menuPubblicoAttivo: publicMenus?.menuPubblicoAttivo || false,
+  
       updatedAt: Date.now(),
     });
 
