@@ -75,7 +75,26 @@ app.post("/sync-menu", async (req, res) => {
         publicMenus = null,  
     } = req.body;
 
-    await appbaseDb.collection("publicMenus").doc(localeId).set({
+// sostituisci il blocco set() in /sync-menu
+const updateData = {
+  companyName: companyName || "Senza Nome",
+  categorie,
+  sottocategorie,
+  prodotti,
+  updatedAt: Date.now(),
+};
+
+if (publicMenus) {
+  updateData.orari = publicMenus.orari || {};
+  updateData.chiusure = publicMenus.chiusure || [];
+  updateData.offerte = publicMenus.offerte || [];
+  updateData.menuPubblicoAttivo = publicMenus.menuPubblicoAttivo || false;
+}
+
+await appbaseDb.collection("publicMenus").doc(localeId).set(updateData, { merge: true });
+
+
+{/** await appbaseDb.collection("publicMenus").doc(localeId).set({
       companyName: companyName || "Senza Nome",
       categorie,
       sottocategorie,
@@ -88,7 +107,8 @@ app.post("/sync-menu", async (req, res) => {
   
       updatedAt: Date.now(),
     });
-
+ */}
+   
     res.json({ success: true });
   } catch (err) {
     console.error(err);
