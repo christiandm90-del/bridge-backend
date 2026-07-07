@@ -87,6 +87,7 @@ const updateData = {
 if (publicMenus) {
   updateData.orari = publicMenus.orari || {};
   updateData.chiusure = publicMenus.chiusure || [];
+  updateData.chiusurePeriodo = publicMenus.chiusurePeriodo || null;
   updateData.offerte = publicMenus.offerte || [];
   updateData.menuPubblicoAttivo = publicMenus.menuPubblicoAttivo || false;
 }
