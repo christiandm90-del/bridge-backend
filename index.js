@@ -649,6 +649,37 @@ return res.status(403).json({
 });
   }
 }); */}
+
+app.get("/resolve-table/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!token) return res.status(400).json({ error: "token mancante" });
+
+    const snap = await demasDb.collection("qrLookup").doc(token).get();
+    if (!snap.exists) return res.status(404).json({ error: "QR non valido o scaduto" });
+
+    const data = snap.data();
+    const ora = Date.now();
+
+    if (data.scadeAt != null && data.scadeAt < ora) {
+      return res.status(410).json({ error: "QR scaduto" });
+    }
+
+    res.json({
+      localeId: data.localeId,
+      tableId: data.tableId,
+      sessionToken: data.sessionToken,
+      scadeAt: data.scadeAt ?? null,
+      creataAt: data.creataAt ?? ora,
+      tableNome: data.tableNome,
+    });
+  } catch (err) {
+    console.error("❌ resolve-table error:", err);
+    res.status(500).json({ error: "Errore risoluzione QR" });
+  }
+});
+
+
 /* =========================
    START
 ========================= */
