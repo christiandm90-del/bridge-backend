@@ -60,7 +60,9 @@ app.get("/", (req, res) => {
 /* =========================
    SYNC MENU (DEMAS → APPBASE)
 ========================= */
-app.post("/sync-menu", async (req, res) => {
+
+
+{/**app.post("/sync-menu", async (req, res) => {
   try {
     if (req.body.secret !== API_KEY) {
       return res.status(403).json({ error: "unauthorized" });
@@ -110,13 +112,68 @@ await appbaseDb.collection("publicMenus").doc(localeId).set(updateData, { merge:
     });
  */}
    
-    res.json({ success: true });
+  //  res.json({ success: true });
+  //} catch (err) {
+   // console.error(err);
+   // res.status(500).json({ error: "server error" });
+ // }
+//}); 
+//*/}
+/* =========================
+   SYNC MENU (DEMAS → APPBASE)
+========================= prev versione^ */
+app.post("/sync-menu", async (req, res) => {
+  try {
+    if (req.body.secret !== API_KEY) {
+      return res.status(403).json({ error: "unauthorized" });
+    }
+
+    const {
+      localeId,
+      companyName,
+      categorie = [],
+      sottocategorie = [],
+      prodotti = [],
+      publicMenus = null,
+    } = req.body;
+
+    if (!localeId) {
+      return res.status(400).json({ error: "localeId mancante" });
+    }
+
+    const updateData = {
+      companyName: companyName || "Senza Nome",
+      categorie,
+      sottocategorie,
+      prodotti,
+      updatedAt: Date.now(),
+    };
+
+    if (publicMenus) {
+      updateData.orari = publicMenus.orari || {};
+      updateData.chiusure = publicMenus.chiusure || [];
+      updateData.chiusurePeriodo = publicMenus.chiusurePeriodo || null;
+      updateData.offerte = publicMenus.offerte || [];
+      updateData.menuPubblicoAttivo = publicMenus.menuPubblicoAttivo || false;
+      updateData.pagamentoLocaleAttivo = publicMenus.pagamentoLocaleAttivo !== false;
+
+      // Salvataggio delivery completa
+      if (publicMenus.delivery) {
+        updateData.delivery = {
+          ...publicMenus.delivery,
+          lastUpdated: Date.now(),
+        };
+      }
+    }
+
+    await appbaseDb.collection("publicMenus").doc(localeId).set(updateData, { merge: true });
+
+    res.json({ success: true, message: "Menu sincronizzato correttamente" });
   } catch (err) {
-    console.error(err);
+    console.error("Errore sync-menu:", err);
     res.status(500).json({ error: "server error" });
   }
 });
-
 /* =========================
    HELPER: distanza in metri (haversine)
 ========================= */
@@ -138,7 +195,8 @@ async function verificaEcorreggiProdotti(localeId, prodottiClient) {
   const menuSnap = await appbaseDb.collection("publicMenus").doc(localeId).get();
   if (!menuSnap.exists) return null;
 
-  const menuProdotti = menuSnap.data().prodotti || [];
+  const menuData = menuSnap.data();
+  const menuProdotti = menuData.prodotti || [];
   const mappaPrezzi = new Map();
   menuProdotti.forEach((p) => {
     if (p && p.nome) mappaPrezzi.set(String(p.nome).trim().toLowerCase(), Number(p.prezzo) || 0);
@@ -148,12 +206,18 @@ async function verificaEcorreggiProdotti(localeId, prodottiClient) {
   for (const item of prodottiClient) {
     const chiave = String(item?.nome || "").trim().toLowerCase();
     const prezzoReale = mappaPrezzi.get(chiave);
-    if (prezzoReale == null) return null; // prodotto non in menu: sospetto, rifiuta
+    if (prezzoReale == null) return null;
     prodottiCorretti.push({ ...item, prezzo: prezzoReale });
   }
 
   const totale = Math.round(prodottiCorretti.reduce((s, p) => s + p.prezzo, 0) * 100) / 100;
-  return { prodotti: prodottiCorretti, totale };
+  return {
+    prodotti: prodottiCorretti,
+    totale,
+    settings: {
+      pagamentoLocaleAttivo: menuData.pagamentoLocaleAttivo !== false, // default true
+    },
+  };
 }
 /* =========================
    CREATE PAYMENT INTENT (Stripe)
@@ -238,6 +302,9 @@ app.post("/send-order", async (req, res) => {
     }
     const prodottiVerificati = verificato.prodotti;
     const totaleVerificato = verificato.totale;
+    if (metodoPagamento === "locale" && !verificato.settings.pagamentoLocaleAttivo) {
+  return res.status(403).json({ error: "pagamento_locale_non_disponibile" });
+}
 
     let pagamentoVerificato = false;
     if (metodoPagamento === "Paga con carta") {
