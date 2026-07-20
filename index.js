@@ -389,7 +389,7 @@ app.post("/send-order", async (req, res) => {
       }
     }
 
-    const now = new Date();
+ const now = new Date();
     const formatter = new Intl.DateTimeFormat("it-IT", {
       timeZone: "Europe/Rome", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
     });
@@ -398,6 +398,11 @@ app.post("/send-order", async (req, res) => {
     const ordineId = `${get("day")}-${get("month")}_${get("hour")}-${get("minute")}_${
       String(decoded.email || "utente").replace(/[@.]/g, "-").slice(0, 40)
     }_${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+
+    // ⛔ Sessione non valida → blocca PRIMA di scrivere l'ordine
+    if (spam) {
+      return res.status(409).json({ error: "sessione_non_valida", scollega: true });
+    }
 
     await demasDb
       .collection("bars").doc(localeId)
@@ -410,7 +415,7 @@ app.post("/send-order", async (req, res) => {
           telefono: String(userData.phone || "").slice(0, 30),
         },
         tavolo: tavoloRisolto,
-       note: note || noteCliente || null,
+        note: note || noteCliente || null,
         tableId: tableId ?? null,
         daVerificare,
         spam,
@@ -424,10 +429,6 @@ app.post("/send-order", async (req, res) => {
         status: "nuovo",
         source: "appbase",
       });
-
-    if (spam) {
-      return res.status(409).json({ error: "sessione_non_valida", scollega: true });
-    }
 
     res.json({ success: true });
   } catch (err) {
