@@ -225,7 +225,9 @@ async function verificaEcorreggiProdotti(localeId, prodottiClient) {
    Body: { token, totale, localeId }
    Returns: { clientSecret }
 ========================= */
-app.post("/create-payment-intent", async (req, res) => {
+
+{/*prev...
+ app.post("/create-payment-intent", async (req, res) => {
   try {
     const { token, prodotti, localeId } = req.body;
 
@@ -264,7 +266,79 @@ app.post("/create-payment-intent", async (req, res) => {
     console.error("❌ Stripe error:", err);
     res.status(500).json({ error: "Errore creazione pagamento" });
   }
+}); 
+  
+  */}
+
+app.post("/create-payment-intent", async (req, res) => {
+  try {
+    const { token, prodotti, localeId, tableId, sessionToken } = req.body;
+
+    if (!token) {
+      return res.status(401).json({ error: "Utente non autenticato" });
+    }
+
+    const decoded = await appbaseApp.auth().verifyIdToken(token);
+
+    if (!localeId) {
+      return res.status(400).json({ error: "localeId mancante" });
+    }
+    if (!Array.isArray(prodotti) || prodotti.length === 0) {
+      return res.status(400).json({ error: "prodotti mancanti" });
+    }
+
+    // Sessione tavolo → blocca PRIMA di autorizzare qualunque addebito
+    if (tableId != null) {
+      try {
+        const sessioneSnap = await demasDb
+          .collection("bars").doc(localeId)
+          .collection("sessioniTavolo").doc(String(tableId))
+          .get();
+
+        let sessioneValida = false;
+        if (sessioneSnap.exists) {
+          const sessione = sessioneSnap.data();
+          const ora = Date.now();
+          sessioneValida =
+            sessione.attivo === true &&
+            sessione.token === sessionToken &&
+            (sessione.scadeAt == null || sessione.scadeAt > ora);
+        }
+
+        if (!sessioneValida) {
+          return res.status(409).json({ error: "sessione_non_valida", scollega: true });
+        }
+      } catch (err) {
+        console.error("Errore validazione sessione tavolo (payment-intent):", err);
+        return res.status(409).json({ error: "sessione_non_valida", scollega: true });
+      }
+    }
+
+    const verificato = await verificaEcorreggiProdotti(localeId, prodotti);
+    if (!verificato) {
+      return res.status(400).json({ error: "Prodotti non riconosciuti nel menu" });
+    }
+
+    const importoCentesimi = Math.round(verificato.totale * 100);
+    if (!importoCentesimi || importoCentesimi < 50) {
+      return res.status(400).json({ error: "Importo non valido (minimo 0.50€)" });
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: importoCentesimi,
+      currency: "eur",
+      automatic_payment_methods: { enabled: true },
+      metadata: { localeId, uid: decoded.uid, email: decoded.email || "" },
+    });
+
+    res.json({ clientSecret: paymentIntent.client_secret, totaleVerificato: verificato.totale });
+  } catch (err) {
+    console.error("❌ Stripe error:", err);
+    res.status(500).json({ error: "Errore creazione pagamento" });
+  }
 });
+
+
 
 /* =========================
    SEND ORDER (APPBASE → DEMAS)
