@@ -1020,7 +1020,52 @@ app.post("/billing/create-checkout-session", async (req, res) => {
     res.status(500).json({ error: "Errore creazione sessione di pagamento" });
   }
 });
+/* =========================
+   BILLING — CAMBIA PIANO (abbonamento già attivo)
+   POST /billing/change-plan
+   Body: { token, barId, planId }
+========================= */
+app.post("/billing/change-plan", async (req, res) => {
+  try {
+    const { token, barId, planId } = req.body;
+    if (!token) return res.status(401).json({ error: "Utente non autenticato" });
 
+    const decoded = await demasApp.auth().verifyIdToken(token);
+    if (!barId || !planId) return res.status(400).json({ error: "barId o planId mancante" });
+
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const infoSnap = await infoRef.get();
+    if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
+
+    const info = infoSnap.data();
+    if (info.uid !== decoded.uid) {
+      return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    }
+    if (!info.stripeSubscriptionId) {
+      return res.status(400).json({ error: "Nessun abbonamento attivo — usa create-checkout-session" });
+    }
+
+    const planSnap = await demasDb.collection("plans").doc(planId).get();
+    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
+    const plan = planSnap.data();
+    if (!plan.stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online" });
+
+    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    const itemId = subscription.items.data[0].id;
+
+    await stripe.subscriptions.update(info.stripeSubscriptionId, {
+      items: [{ id: itemId, price: plan.stripePriceId }],
+      proration_behavior: "create_prorations", // addebita/accredita la differenza pro-rata
+      metadata: { barId, planId },
+    });
+
+    res.json({ success: true });
+    // L'applicazione vera e propria del piano arriva dal webhook customer.subscription.updated
+  } catch (err) {
+    console.error("❌ Errore change-plan:", err);
+    res.status(500).json({ error: "Errore cambio piano" });
+  }
+});
 /* =========================
    START
 ========================= */
