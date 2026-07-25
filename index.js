@@ -1090,18 +1090,33 @@ app.post("/billing/change-plan", async (req, res) => {
     if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
 
     const info = infoSnap.data();
-    if (info.uid !== decoded.uid) {
-      return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+
+    // Gestione passaggio a Free
+    if (planId === "free" || planId === "freeplan") {
+      if (info.stripeSubscriptionId) {
+        const sub = await stripe.subscriptions.update(info.stripeSubscriptionId, { cancel_at_period_end: true });
+        await infoRef.update({
+          "piano.cancellazionePendente": true,
+          "piano.cancellaIl": sub.cancel_at ? admin.firestore.Timestamp.fromMillis(sub.cancel_at * 1000) : null,
+        });
+      } else {
+        await applyPlanToBar(barId, planId, "manual_free", cicloScelto);
+      }
+      return res.json({ success: true, mode: "free" });
     }
+
+    // Se NON ha ancora un abbonamento Stripe, DEVE usare checkout
     if (!info.stripeSubscriptionId) {
-      return res.status(400).json({ error: "Nessun abbonamento attivo — usa create-checkout-session" });
+      return res.status(400).json({ error: "REQUIRES_CHECKOUT", message: "Nessun abbonamento Stripe attivo." });
     }
 
     const planSnap = await demasDb.collection("plans").doc(planId).get();
-    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
+    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato in Firestore" });
+    
     const plan = planSnap.data();
     const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
-    if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
+    if (!stripePriceId) return res.status(400).json({ error: "stripePriceId assente per questo ciclo" });
 
     const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
     const itemId = subscription.items.data[0].id;
@@ -1109,15 +1124,14 @@ app.post("/billing/change-plan", async (req, res) => {
     await stripe.subscriptions.update(info.stripeSubscriptionId, {
       items: [{ id: itemId, price: stripePriceId }],
       proration_behavior: "create_prorations",
-      cancel_at_period_end: false, // scegliere un piano annulla un'eventuale cancellazione già programmata
+      cancel_at_period_end: false,
       metadata: { barId, planId, ciclo: cicloScelto },
     });
 
-    res.json({ success: true });
-    // L'applicazione vera e propria del piano arriva dal webhook customer.subscription.updated
+    res.json({ success: true, mode: "updated" });
   } catch (err) {
     console.error("❌ Errore change-plan:", err);
-    res.status(500).json({ error: "Errore cambio piano" });
+    res.status(500).json({ error: err.message });
   }
 });
 
