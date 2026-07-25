@@ -31,14 +31,44 @@ app.post(
 
     try {
       switch (event.type) {
-        case "checkout.session.completed": {
+       case "checkout.session.completed": {
           const session = event.data.object;
-          const { barId, planId } = session.metadata || {};
+          const { barId, planId, ciclo } = session.metadata || {};
+          // Con metodi di pagamento ritardati (es. SEPA) il checkout può
+          // risultare "completato" prima che il pagamento sia confermato:
+          // in quel caso aspettiamo async_payment_succeeded.
+          if (barId && planId && session.payment_status === "paid") {
+            const aggiornamento = { stripeSubscriptionId: session.subscription || null };
+            if (session.subscription) {
+              const sub = await stripe.subscriptions.retrieve(session.subscription);
+              aggiornamento["piano.rinnovoIl"] = admin.firestore.Timestamp.fromMillis(sub.current_period_end * 1000);
+            }
+            await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update(aggiornamento);
+            await applyPlanToBar(barId, planId, "stripe-webhook", ciclo || "mensile");
+          }
+          break;
+        }
+
+        case "checkout.session.async_payment_succeeded": {
+          const session = event.data.object;
+          const { barId, planId, ciclo } = session.metadata || {};
           if (barId && planId) {
-            await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
-              stripeSubscriptionId: session.subscription || null,
-            });
-            await applyPlanToBar(barId, planId, "stripe-webhook");
+            const aggiornamento = { stripeSubscriptionId: session.subscription || null };
+            if (session.subscription) {
+              const sub = await stripe.subscriptions.retrieve(session.subscription);
+              aggiornamento["piano.rinnovoIl"] = admin.firestore.Timestamp.fromMillis(sub.current_period_end * 1000);
+            }
+            await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update(aggiornamento);
+            await applyPlanToBar(barId, planId, "stripe-webhook", ciclo || "mensile");
+          }
+          break;
+        }
+
+        case "checkout.session.async_payment_failed": {
+          const session = event.data.object;
+          const { barId } = session.metadata || {};
+          if (barId) {
+            console.log(`⚠️ Pagamento asincrono fallito per locale ${barId}`);
           }
           break;
         }
@@ -57,23 +87,26 @@ app.post(
           if (!barsSnap.empty) {
             const barId = barsSnap.docs[0].ref.parent.parent.id;
 
-            await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
+          await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
               "piano.cancellazionePendente": subscription.cancel_at_period_end === true,
               "piano.cancellaIl": subscription.cancel_at
                 ? admin.firestore.Timestamp.fromMillis(subscription.cancel_at * 1000)
                 : null,
+              "piano.rinnovoIl": subscription.current_period_end
+                ? admin.firestore.Timestamp.fromMillis(subscription.current_period_end * 1000)
+                : null,
             });
 
-            if (subscription.status === "active" && priceId) {
-              const planId = await findPlanIdByStripePriceId(priceId);
-              if (planId) await applyPlanToBar(barId, planId, "stripe-webhook");
+           if (subscription.status === "active" && priceId) {
+              const trovato = await findPlanByStripePriceId(priceId);
+              if (trovato) await applyPlanToBar(barId, trovato.planId, "stripe-webhook", trovato.ciclo);
             }
             // status "past_due" ecc: nessuna azione automatica sui limiti per ora
           }
           break;
         }
 
-        case "customer.subscription.deleted": {
+      case "customer.subscription.deleted": {
           const subscription = event.data.object;
           const customerId = subscription.customer;
 
@@ -87,6 +120,18 @@ app.post(
             const barId = barsSnap.docs[0].ref.parent.parent.id;
             await applyPlanToBar(barId, "free", "stripe-webhook-cancellation");
           }
+          break;
+        }
+
+        case "invoice.payment_failed": {
+          const invoice = event.data.object;
+          console.log(`⚠️ Fattura non pagata — customer ${invoice.customer}, invoice ${invoice.id}`);
+          break;
+        }
+
+        case "invoice.paid": {
+          const invoice = event.data.object;
+          console.log(`✅ Fattura pagata — customer ${invoice.customer}, invoice ${invoice.id}`);
           break;
         }
 
@@ -924,7 +969,7 @@ app.get("/resolve-table/:token", async (req, res) => {
 /* =========================
    BILLING — HELPER
 ========================= */
-async function applyPlanToBar(barId, planId, source) {
+async function applyPlanToBar(barId, planId, source, ciclo = "mensile") {
   const planSnap = await demasDb.collection("plans").doc(planId).get();
   if (!planSnap.exists) throw new Error(`Piano "${planId}" non trovato in /plans`);
   const plan = planSnap.data();
@@ -940,9 +985,10 @@ async function applyPlanToBar(barId, planId, source) {
     if (emp?.id) permissions[emp.id] = { ...plan.permissionsDefault };
   });
 
-  await infoRef.update({
+await infoRef.update({
     piano: {
       tipo: planId,
+      ciclo,
       personalizzato: false,
       aggiornatoDa: source,
       aggiornatoIl: admin.firestore.FieldValue.serverTimestamp(),
@@ -953,12 +999,18 @@ async function applyPlanToBar(barId, planId, source) {
     },
   });
 
-  console.log(`✅ Piano di ${barId} aggiornato a "${planId}" (${source})`);
+  console.log(`✅ Piano di ${barId} aggiornato a "${planId}" (${ciclo}, ${source})`);
 }
 
-async function findPlanIdByStripePriceId(priceId) {
-  const snap = await demasDb.collection("plans").where("stripePriceId", "==", priceId).limit(1).get();
-  return snap.empty ? null : snap.docs[0].id;
+// Cerca un piano per price id, sia mensile che annuale, e restituisce anche il ciclo trovato
+async function findPlanByStripePriceId(priceId) {
+  const snapMensile = await demasDb.collection("plans").where("stripePriceIdMensile", "==", priceId).limit(1).get();
+  if (!snapMensile.empty) return { planId: snapMensile.docs[0].id, ciclo: "mensile" };
+
+  const snapAnnuale = await demasDb.collection("plans").where("stripePriceIdAnnuale", "==", priceId).limit(1).get();
+  if (!snapAnnuale.empty) return { planId: snapAnnuale.docs[0].id, ciclo: "annuale" };
+
+  return null;
 }
 
 /* =========================
@@ -968,9 +1020,10 @@ async function findPlanIdByStripePriceId(priceId) {
 ========================= */
 app.post("/billing/create-checkout-session", async (req, res) => {
   try {
-    const { token, barId, planId } = req.body;
+    const { token, barId, planId, ciclo } = req.body;
     if (!token) return res.status(401).json({ error: "Utente non autenticato" });
 
+    const cicloScelto = ciclo === "annuale" ? "annuale" : "mensile";
     const decoded = await demasApp.auth().verifyIdToken(token);
     if (!barId || !planId) return res.status(400).json({ error: "barId o planId mancante" });
 
@@ -987,8 +1040,9 @@ app.post("/billing/create-checkout-session", async (req, res) => {
     if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
 
     const plan = planSnap.data();
-    if (!plan.stripePriceId) {
-      return res.status(400).json({ error: "Piano non acquistabile online" });
+    const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
+    if (!stripePriceId) {
+      return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
     }
 
     let stripeCustomerId = info.stripeCustomerId;
@@ -1005,10 +1059,10 @@ app.post("/billing/create-checkout-session", async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: stripeCustomerId,
-      line_items: [{ price: plan.stripePriceId, quantity: 1 }],
-      success_url: `${process.env.DEMAS_APP_BASE_URL}/piani?esito=successo`,
-      cancel_url: `${process.env.DEMAS_APP_BASE_URL}/piani?esito=annullato`,
-      metadata: { barId, planId },
+      line_items: [{ price: stripePriceId, quantity: 1 }],
+      success_url: `${process.env.DEMAS_APP_BASE_URL}/piani?checkout=success`,
+      cancel_url: `${process.env.DEMAS_APP_BASE_URL}/piani?checkout=cancel`,
+      metadata: { barId, planId, ciclo: cicloScelto },
     });
 
     res.json({ url: session.url });
@@ -1024,9 +1078,10 @@ app.post("/billing/create-checkout-session", async (req, res) => {
 ========================= */
 app.post("/billing/change-plan", async (req, res) => {
   try {
-    const { token, barId, planId } = req.body;
+    const { token, barId, planId, ciclo } = req.body;
     if (!token) return res.status(401).json({ error: "Utente non autenticato" });
 
+    const cicloScelto = ciclo === "annuale" ? "annuale" : "mensile";
     const decoded = await demasApp.auth().verifyIdToken(token);
     if (!barId || !planId) return res.status(400).json({ error: "barId o planId mancante" });
 
@@ -1045,16 +1100,17 @@ app.post("/billing/change-plan", async (req, res) => {
     const planSnap = await demasDb.collection("plans").doc(planId).get();
     if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
     const plan = planSnap.data();
-    if (!plan.stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online" });
+    const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
+    if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
 
     const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
     const itemId = subscription.items.data[0].id;
 
-  await stripe.subscriptions.update(info.stripeSubscriptionId, {
-      items: [{ id: itemId, price: plan.stripePriceId }],
+    await stripe.subscriptions.update(info.stripeSubscriptionId, {
+      items: [{ id: itemId, price: stripePriceId }],
       proration_behavior: "create_prorations",
-      cancel_at_period_end: false,
-      metadata: { barId, planId },
+      cancel_at_period_end: false, // scegliere un piano annulla un'eventuale cancellazione già programmata
+      metadata: { barId, planId, ciclo: cicloScelto },
     });
 
     res.json({ success: true });
