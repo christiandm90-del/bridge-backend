@@ -1009,8 +1009,8 @@ app.post("/billing/create-checkout-session", async (req, res) => {
       mode: "subscription",
       customer: stripeCustomerId,
       line_items: [{ price: plan.stripePriceId, quantity: 1 }],
-      success_url: `${process.env.DEMAS_APP_BASE_URL}/piani?esito=successo`,
-      cancel_url: `${process.env.DEMAS_APP_BASE_URL}/piani?esito=annullato`,
+  success_url: `${process.env.DEMAS_APP_BASE_URL}/?checkout=success`,
+cancel_url: `${process.env.DEMAS_APP_BASE_URL}/?checkout=cancel`,
       metadata: { barId, planId },
     });
 
