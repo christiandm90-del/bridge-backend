@@ -43,7 +43,7 @@ app.post(
           break;
         }
 
-        case "customer.subscription.updated": {
+      case "customer.subscription.updated": {
           const subscription = event.data.object;
           const priceId = subscription.items?.data?.[0]?.price?.id;
           const customerId = subscription.customer;
@@ -54,9 +54,17 @@ app.post(
             .limit(1)
             .get();
 
-          if (!barsSnap.empty && priceId) {
+          if (!barsSnap.empty) {
             const barId = barsSnap.docs[0].ref.parent.parent.id;
-            if (subscription.status === "active") {
+
+            await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
+              "piano.cancellazionePendente": subscription.cancel_at_period_end === true,
+              "piano.cancellaIl": subscription.cancel_at
+                ? admin.firestore.Timestamp.fromMillis(subscription.cancel_at * 1000)
+                : null,
+            });
+
+            if (subscription.status === "active" && priceId) {
               const planId = await findPlanIdByStripePriceId(priceId);
               if (planId) await applyPlanToBar(barId, planId, "stripe-webhook");
             }
@@ -924,18 +932,7 @@ async function applyPlanToBar(barId, planId, source) {
   const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
   const infoSnap = await infoRef.get();
   if (!infoSnap.exists) throw new Error(`Locale "${barId}" non trovato`);
-  const info = infoSnap.data();
-
-  // Locale personalizzato → aggiorna solo il riferimento al piano, non toccare zoneConfig
-  if (info.piano?.personalizzato === true) {
-    await infoRef.update({
-      "piano.tipo": planId,
-      "piano.aggiornatoDa": source,
-      "piano.aggiornatoIl": admin.firestore.FieldValue.serverTimestamp(),
-    });
-    console.log(`⚠️ Piano di ${barId} → "${planId}" ma zoneConfig NON toccato (personalizzato)`);
-    return;
-  }
+ const info = infoSnap.data();
 
   const employees = Array.isArray(info.employees) ? info.employees : [];
   const permissions = {};
@@ -1053,9 +1050,10 @@ app.post("/billing/change-plan", async (req, res) => {
     const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
     const itemId = subscription.items.data[0].id;
 
-    await stripe.subscriptions.update(info.stripeSubscriptionId, {
+  await stripe.subscriptions.update(info.stripeSubscriptionId, {
       items: [{ id: itemId, price: plan.stripePriceId }],
-      proration_behavior: "create_prorations", // addebita/accredita la differenza pro-rata
+      proration_behavior: "create_prorations",
+      cancel_at_period_end: false,
       metadata: { barId, planId },
     });
 
@@ -1066,6 +1064,79 @@ app.post("/billing/change-plan", async (req, res) => {
     res.status(500).json({ error: "Errore cambio piano" });
   }
 });
+
+/* =========================
+   BILLING — ANNULLA ABBONAMENTO (torna a Free a fine periodo già pagato)
+   POST /billing/cancel-subscription
+========================= */
+app.post("/billing/cancel-subscription", async (req, res) => {
+  try {
+    const { token, barId } = req.body;
+    if (!token) return res.status(401).json({ error: "Utente non autenticato" });
+
+    const decoded = await demasApp.auth().verifyIdToken(token);
+    if (!barId) return res.status(400).json({ error: "barId mancante" });
+
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const infoSnap = await infoRef.get();
+    if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
+
+    const info = infoSnap.data();
+    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    if (!info.stripeSubscriptionId) return res.status(400).json({ error: "Nessun abbonamento attivo" });
+
+    const subscription = await stripe.subscriptions.update(info.stripeSubscriptionId, {
+      cancel_at_period_end: true,
+    });
+
+    await infoRef.update({
+      "piano.cancellazionePendente": true,
+      "piano.cancellaIl": subscription.cancel_at
+        ? admin.firestore.Timestamp.fromMillis(subscription.cancel_at * 1000)
+        : null,
+    });
+
+    res.json({ success: true, cancelAt: subscription.cancel_at });
+  } catch (err) {
+    console.error("❌ Errore cancel-subscription:", err);
+    res.status(500).json({ error: "Errore cancellazione abbonamento" });
+  }
+});
+
+/* =========================
+   BILLING — ANNULLA LA DISDETTA (resta sul piano attuale)
+   POST /billing/resume-subscription
+========================= */
+app.post("/billing/resume-subscription", async (req, res) => {
+  try {
+    const { token, barId } = req.body;
+    if (!token) return res.status(401).json({ error: "Utente non autenticato" });
+
+    const decoded = await demasApp.auth().verifyIdToken(token);
+    if (!barId) return res.status(400).json({ error: "barId mancante" });
+
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const infoSnap = await infoRef.get();
+    if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
+
+    const info = infoSnap.data();
+    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    if (!info.stripeSubscriptionId) return res.status(400).json({ error: "Nessun abbonamento attivo" });
+
+    await stripe.subscriptions.update(info.stripeSubscriptionId, { cancel_at_period_end: false });
+
+    await infoRef.update({
+      "piano.cancellazionePendente": false,
+      "piano.cancellaIl": null,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Errore resume-subscription:", err);
+    res.status(500).json({ error: "Errore riattivazione abbonamento" });
+  }
+});
+
 /* =========================
    START
 ========================= */
