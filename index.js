@@ -5,6 +5,99 @@ const Stripe = require("stripe");
 
 const app = express();
 app.use(cors());
+/* =========================
+   BILLING — WEBHOOK STRIPE
+   Deve stare PRIMA di express.json(): serve il body raw per la firma
+========================= */
+app.post(
+  "/billing/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    let event;
+    try {
+      const sig = req.headers["stripe-signature"];
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.error("❌ Firma webhook non valida:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Idempotenza: se l'evento è già stato processato, rispondi e basta
+    const eventRef = demasDb.collection("stripeEventsProcessed").doc(event.id);
+    const eventSnap = await eventRef.get();
+    if (eventSnap.exists) {
+      return res.json({ received: true, duplicate: true });
+    }
+
+    try {
+      switch (event.type) {
+        case "checkout.session.completed": {
+          const session = event.data.object;
+          const { barId, planId } = session.metadata || {};
+          if (barId && planId) {
+            await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
+              stripeSubscriptionId: session.subscription || null,
+            });
+            await applyPlanToBar(barId, planId, "stripe-webhook");
+          }
+          break;
+        }
+
+        case "customer.subscription.updated": {
+          const subscription = event.data.object;
+          const priceId = subscription.items?.data?.[0]?.price?.id;
+          const customerId = subscription.customer;
+
+          const barsSnap = await demasDb
+            .collectionGroup("meta")
+            .where("stripeCustomerId", "==", customerId)
+            .limit(1)
+            .get();
+
+          if (!barsSnap.empty && priceId) {
+            const barId = barsSnap.docs[0].ref.parent.parent.id;
+            if (subscription.status === "active") {
+              const planId = await findPlanIdByStripePriceId(priceId);
+              if (planId) await applyPlanToBar(barId, planId, "stripe-webhook");
+            }
+            // status "past_due" ecc: nessuna azione automatica sui limiti per ora
+          }
+          break;
+        }
+
+        case "customer.subscription.deleted": {
+          const subscription = event.data.object;
+          const customerId = subscription.customer;
+
+          const barsSnap = await demasDb
+            .collectionGroup("meta")
+            .where("stripeCustomerId", "==", customerId)
+            .limit(1)
+            .get();
+
+          if (!barsSnap.empty) {
+            const barId = barsSnap.docs[0].ref.parent.parent.id;
+            await applyPlanToBar(barId, "free", "stripe-webhook-cancellation");
+          }
+          break;
+        }
+
+        default:
+          break;
+      }
+
+      await eventRef.set({
+        processedAt: admin.firestore.FieldValue.serverTimestamp(),
+        type: event.type,
+      });
+      res.json({ received: true });
+    } catch (err) {
+      console.error("❌ Errore elaborazione webhook:", err);
+      // 500 → Stripe ritenta (utile per errori transitori tipo Firestore irraggiungibile)
+      res.status(500).json({ error: "Errore elaborazione webhook" });
+    }
+  }
+);
 app.use(express.json());
 
 // Stripe inizializzato con chiave segreta da env
@@ -820,7 +913,113 @@ app.get("/resolve-table/:token", async (req, res) => {
     res.status(500).json({ error: "Errore risoluzione QR" });
   }
 });
+/* =========================
+   BILLING — HELPER
+========================= */
+async function applyPlanToBar(barId, planId, source) {
+  const planSnap = await demasDb.collection("plans").doc(planId).get();
+  if (!planSnap.exists) throw new Error(`Piano "${planId}" non trovato in /plans`);
+  const plan = planSnap.data();
 
+  const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+  const infoSnap = await infoRef.get();
+  if (!infoSnap.exists) throw new Error(`Locale "${barId}" non trovato`);
+  const info = infoSnap.data();
+
+  // Locale personalizzato → aggiorna solo il riferimento al piano, non toccare zoneConfig
+  if (info.piano?.personalizzato === true) {
+    await infoRef.update({
+      "piano.tipo": planId,
+      "piano.aggiornatoDa": source,
+      "piano.aggiornatoIl": admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`⚠️ Piano di ${barId} → "${planId}" ma zoneConfig NON toccato (personalizzato)`);
+    return;
+  }
+
+  const employees = Array.isArray(info.employees) ? info.employees : [];
+  const permissions = {};
+  employees.forEach((emp) => {
+    if (emp?.id) permissions[emp.id] = { ...plan.permissionsDefault };
+  });
+
+  await infoRef.update({
+    piano: {
+      tipo: planId,
+      personalizzato: false,
+      aggiornatoDa: source,
+      aggiornatoIl: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    zoneConfig: {
+      limits: plan.limits,
+      permissions,
+    },
+  });
+
+  console.log(`✅ Piano di ${barId} aggiornato a "${planId}" (${source})`);
+}
+
+async function findPlanIdByStripePriceId(priceId) {
+  const snap = await demasDb.collection("plans").where("stripePriceId", "==", priceId).limit(1).get();
+  return snap.empty ? null : snap.docs[0].id;
+}
+
+/* =========================
+   BILLING — CREA SESSIONE CHECKOUT
+   POST /billing/create-checkout-session
+   Body: { token, barId, planId }
+========================= */
+app.post("/billing/create-checkout-session", async (req, res) => {
+  try {
+    const { token, barId, planId } = req.body;
+    if (!token) return res.status(401).json({ error: "Utente non autenticato" });
+
+    const decoded = await demasApp.auth().verifyIdToken(token);
+    if (!barId || !planId) return res.status(400).json({ error: "barId o planId mancante" });
+
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const infoSnap = await infoRef.get();
+    if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
+
+    const info = infoSnap.data();
+    if (info.uid !== decoded.uid) {
+      return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    }
+
+    const planSnap = await demasDb.collection("plans").doc(planId).get();
+    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
+
+    const plan = planSnap.data();
+    if (!plan.stripePriceId) {
+      return res.status(400).json({ error: "Piano non acquistabile online" });
+    }
+
+    let stripeCustomerId = info.stripeCustomerId;
+    if (!stripeCustomerId) {
+      const customer = await stripe.customers.create({
+        email: info.email || undefined,
+        name: info.companyName || undefined,
+        metadata: { barId },
+      });
+      stripeCustomerId = customer.id;
+      await infoRef.update({ stripeCustomerId });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: stripeCustomerId,
+      line_items: [{ price: plan.stripePriceId, quantity: 1 }],
+      success_url: `${process.env.DEMAS_APP_BASE_URL}/piani?esito=successo`,
+      cancel_url: `${process.env.DEMAS_APP_BASE_URL}/piani?esito=annullato`,
+      metadata: { barId, planId },
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("❌ Errore create-checkout-session:", err);
+    res.status(500).json({ error: "Errore creazione sessione di pagamento" });
+  }
+});
 
 /* =========================
    START
