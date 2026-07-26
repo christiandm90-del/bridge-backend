@@ -39,9 +39,10 @@ app.post(
           // in quel caso aspettiamo async_payment_succeeded.
           if (barId && planId && session.payment_status === "paid") {
             const aggiornamento = { stripeSubscriptionId: session.subscription || null };
-            if (session.subscription) {
+           if (session.subscription) {
               const sub = await stripe.subscriptions.retrieve(session.subscription);
-              aggiornamento["piano.rinnovoIl"] = admin.firestore.Timestamp.fromMillis(sub.current_period_end * 1000);
+              const periodEnd = getCurrentPeriodEnd(sub);
+              if (periodEnd) aggiornamento["piano.rinnovoIl"] = admin.firestore.Timestamp.fromMillis(periodEnd * 1000);
             }
             await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update(aggiornamento);
             await applyPlanToBar(barId, planId, "stripe-webhook", ciclo || "mensile");
@@ -56,7 +57,8 @@ app.post(
             const aggiornamento = { stripeSubscriptionId: session.subscription || null };
             if (session.subscription) {
               const sub = await stripe.subscriptions.retrieve(session.subscription);
-              aggiornamento["piano.rinnovoIl"] = admin.firestore.Timestamp.fromMillis(sub.current_period_end * 1000);
+              const periodEnd = getCurrentPeriodEnd(sub);
+              if (periodEnd) aggiornamento["piano.rinnovoIl"] = admin.firestore.Timestamp.fromMillis(periodEnd * 1000);
             }
             await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update(aggiornamento);
             await applyPlanToBar(barId, planId, "stripe-webhook", ciclo || "mensile");
@@ -87,13 +89,14 @@ app.post(
           if (!barsSnap.empty) {
             const barId = barsSnap.docs[0].ref.parent.parent.id;
 
-          await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
+       const periodEnd = getCurrentPeriodEnd(subscription);
+            await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
               "piano.cancellazionePendente": subscription.cancel_at_period_end === true,
               "piano.cancellaIl": subscription.cancel_at
                 ? admin.firestore.Timestamp.fromMillis(subscription.cancel_at * 1000)
                 : null,
-              "piano.rinnovoIl": subscription.current_period_end
-                ? admin.firestore.Timestamp.fromMillis(subscription.current_period_end * 1000)
+              "piano.rinnovoIl": periodEnd
+                ? admin.firestore.Timestamp.fromMillis(periodEnd * 1000)
                 : null,
             });
 
@@ -1012,7 +1015,12 @@ async function findPlanByStripePriceId(priceId) {
 
   return null;
 }
-
+// Nelle API Stripe recenti current_period_end è sui subscription items,
+// non più sulla subscription stessa — proviamo entrambi i posti.
+function getCurrentPeriodEnd(subscription) {
+  if (subscription.current_period_end) return subscription.current_period_end;
+  return subscription.items?.data?.[0]?.current_period_end ?? null;
+}
 /* =========================
    BILLING — CREA SESSIONE CHECKOUT
    POST /billing/create-checkout-session
