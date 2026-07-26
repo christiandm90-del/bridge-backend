@@ -1037,10 +1037,10 @@ app.post("/billing/create-checkout-session", async (req, res) => {
       return res.status(403).json({ error: "Non autorizzato su questo locale" });
     }
 
-    // CONTROLLO ANTI-DOPPIO PAGAMENTO: Se ha già un abbonamento attivo, blocca!
-    if (info.piano && info.piano.stripeSubscriptionId && info.piano.tipo !== "freeplan") {
-      return res.status(400).json({ 
-        error: "Hai già un abbonamento attivo. Gestisci o cambia il piano esistente anziché crearne uno nuovo." 
+   // CONTROLLO ANTI-DOPPIO PAGAMENTO: Se ha già un abbonamento attivo, blocca!
+    if (info.stripeSubscriptionId) {
+      return res.status(400).json({
+        error: "Hai già un abbonamento attivo. Usa il cambio piano invece di un nuovo checkout."
       });
     }
 
@@ -1080,53 +1080,7 @@ app.post("/billing/create-checkout-session", async (req, res) => {
   }
 });
 
-// 2. AGGIUNGI IL WEBHOOK DI STRIPE (Aggiorna Firestore in automatico)
-app.post("/billing/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  let event;
 
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error("⚠️ Errore firma webhook Stripe:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-    const { barId, planId, ciclo } = session.metadata || {};
-
-    if (barId && planId) {
-      const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
-      
-      // Recupera i dettagli dell'abbonamento da Stripe per avere la data di rinnovo
-      const subscriptionId = session.subscription;
-      let subscriptionData = {};
-      
-      if (subscriptionId) {
-        const sub = await stripe.subscriptions.retrieve(subscriptionId);
-        subscriptionData = {
-          stripeSubscriptionId: subscriptionId,
-          rinnovoIl: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null,
-        };
-      }
-
-      // Aggiorna il database del locale
-      await infoRef.update({
-        "piano.tipo": planId,
-        "piano.ciclo": ciclo || "mensile",
-        "piano.personalizzato": false,
-        "piano.aggiornatoIl": Date.now(),
-        "piano.aggiornatoDa": "stripe_webhook",
-        ...subscriptionData,
-      });
-
-      console.log(`✅ Abbonamento aggiornato con successo per il bar ${barId} al piano ${planId}`);
-    }
-  }
-
-  res.json({ received: true });
-});
 /* =========================
    BILLING — CAMBIA PIANO (abbonamento già attivo)
    POST /billing/change-plan
@@ -1149,85 +1103,33 @@ app.post("/billing/change-plan", async (req, res) => {
     if (info.uid !== decoded.uid) {
       return res.status(403).json({ error: "Non autorizzato su questo locale" });
     }
-
-    // Se sceglie il piano gratuito, disdici l'abbonamento Stripe se presente o passa a free
-    if (planId === "freeplan") {
-      if (info.piano?.stripeSubscriptionId) {
-        await stripe.subscriptions.cancel(info.piano.stripeSubscriptionId);
-      }
-      await infoRef.update({
-        "piano.tipo": "freeplan",
-        "piano.stripeSubscriptionId": null,
-        "piano.ciclo": null,
-        "piano.aggiornatoIl": Date.now(),
-        "piano.aggiornatoDa": "user_downgrade"
-      });
-      return res.json({ success: true });
+    if (!info.stripeSubscriptionId) {
+      return res.status(400).json({ error: "Nessun abbonamento attivo — usa create-checkout-session" });
     }
 
-    // Preleva il nuovo piano dal DB
     const planSnap = await demasDb.collection("plans").doc(planId).get();
     if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
-
     const plan = planSnap.data();
     const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
-    if (!stripePriceId) {
-      return res.status(400).json({ error: "Prezzo non configurato per questo ciclo" });
-    }
+    if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
 
-    const subscriptionId = info.piano?.stripeSubscriptionId;
+    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    const itemId = subscription.items.data[0].id;
 
-    // SE HA GIÀ UN ABBONAMENTO ATTIVO: Aggiorna l'abbonamento esistente (Upgrade/Downgrade immediato con pro-rata)
-    if (subscriptionId) {
-      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-      const subscriptionItemKey = subscription.items.data[0].id;
-
-      await stripe.subscriptions.update(subscriptionId, {
-        cancel_at_period_end: false,
-        proration_behavior: 'create_prorations',
-        items: [{
-          id: subscriptionItemKey,
-          price: stripePriceId,
-        }],
-      });
-
-      // Aggiorna subito Firestore
-      await infoRef.update({
-        "piano.tipo": planId,
-        "piano.ciclo": cicloScelto,
-        "piano.aggiornatoIl": Date.now(),
-        "piano.aggiornatoDa": "stripe_update"
-      });
-
-      return res.json({ success: true, message: "Piano aggiornato con successo" });
-    }
-
-    // SE NON HA UN ABBONAMENTO ATTIVO: Crea una nuova sessione Stripe Checkout
-    let stripeCustomerId = info.stripeCustomerId;
-    if (!stripeCustomerId) {
-      const customer = await stripe.customers.create({
-        email: info.email || undefined,
-        name: info.companyName || undefined,
-        metadata: { barId },
-      });
-      stripeCustomerId = customer.id;
-      await infoRef.update({ stripeCustomerId });
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer: stripeCustomerId,
-      line_items: [{ price: stripePriceId, quantity: 1 }],
-      success_url: `${process.env.DEMAS_APP_BASE_URL}/piani?checkout=success`,
-      cancel_url: `${process.env.DEMAS_APP_BASE_URL}/piani?checkout=cancel`,
+    await stripe.subscriptions.update(info.stripeSubscriptionId, {
+      items: [{ id: itemId, price: stripePriceId }],
+      proration_behavior: "create_prorations",
+      cancel_at_period_end: false,
       metadata: { barId, planId, ciclo: cicloScelto },
     });
 
-    res.json({ url: session.url });
-
+    res.json({ success: true });
+    // L'applicazione vera e propria (piano + zoneConfig) arriva dal webhook
+    // customer.subscription.updated — non scriviamo Firestore qui per evitare
+    // di bypassare il ricalcolo di zoneConfig fatto da applyPlanToBar.
   } catch (err) {
-    console.error("❌ Errore cambio piano:", err);
-    res.status(500).json({ error: err.message || "Errore durante il cambio piano" });
+    console.error("❌ Errore change-plan:", err);
+    res.status(500).json({ error: "Errore cambio piano" });
   }
 });
 /* =========================
