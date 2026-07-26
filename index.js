@@ -75,7 +75,7 @@ app.post(
           break;
         }
 
-      case "customer.subscription.updated": {
+    case "customer.subscription.updated": {
           const subscription = event.data.object;
           const priceId = subscription.items?.data?.[0]?.price?.id;
           const customerId = subscription.customer;
@@ -89,7 +89,7 @@ app.post(
           if (!barsSnap.empty) {
             const barId = barsSnap.docs[0].ref.parent.parent.id;
 
-       const periodEnd = getCurrentPeriodEnd(subscription);
+            const periodEnd = getCurrentPeriodEnd(subscription);
             await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
               "piano.cancellazionePendente": subscription.cancel_at_period_end === true,
               "piano.cancellaIl": subscription.cancel_at
@@ -100,15 +100,22 @@ app.post(
                 : null,
             });
 
-           if (subscription.status === "active" && priceId) {
+            if (subscription.status === "active" && priceId) {
               const trovato = await findPlanByStripePriceId(priceId);
-              if (trovato) await applyPlanToBar(barId, trovato.planId, "stripe-webhook", trovato.ciclo);
+              if (trovato) {
+                // Se stripeSubscriptionId non è ancora salvato (primo acquisto via Payment Sheet,
+                // che non passa da nessuna Checkout Session), lo salviamo qui.
+                if (!barsSnap.docs[0].data().stripeSubscriptionId) {
+                  await demasDb.collection("bars").doc(barId).collection("meta").doc("info")
+                    .update({ stripeSubscriptionId: subscription.id });
+                }
+                // SEMPRE eseguito — è quello che applica il nuovo piano dopo /billing/change-plan
+                await applyPlanToBar(barId, trovato.planId, "stripe-webhook", trovato.ciclo);
+              }
             }
-            // status "past_due" ecc: nessuna azione automatica sui limiti per ora
           }
           break;
         }
-
       case "customer.subscription.deleted": {
           const subscription = event.data.object;
           const customerId = subscription.customer;
@@ -157,7 +164,7 @@ app.post(
 app.use(express.json());
 
 // Stripe inizializzato con chiave segreta da env
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2026-05-27.dahlia" });
 
 const API_KEY = process.env.BRIDGE_SECRET;
 
@@ -1021,15 +1028,16 @@ function getCurrentPeriodEnd(subscription) {
   if (subscription.current_period_end) return subscription.current_period_end;
   return subscription.items?.data?.[0]?.current_period_end ?? null;
 }
+
+
 /* =========================
-   BILLING — CREA SESSIONE CHECKOUT
-   POST /billing/create-checkout-session
-   Body: { token, barId, planId }
+   BILLING — PAYMENT SHEET (primo acquisto, nativo Capacitor)
+   POST /billing/create-payment-sheet
+   Body: { token, barId, planId, ciclo, indirizzo? }
 ========================= */
-// 1. MODIFICA LA CREAZIONE DEL CHECKOUT (Blocca pagamenti multipli se attivo)
-app.post("/billing/create-checkout-session", async (req, res) => {
+app.post("/billing/create-payment-sheet", async (req, res) => {
   try {
-    const { token, barId, planId, ciclo } = req.body;
+    const { token, barId, planId, ciclo, indirizzo } = req.body;
     if (!token) return res.status(401).json({ error: "Utente non autenticato" });
 
     const cicloScelto = ciclo === "annuale" ? "annuale" : "mensile";
@@ -1041,25 +1049,16 @@ app.post("/billing/create-checkout-session", async (req, res) => {
     if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
 
     const info = infoSnap.data();
-    if (info.uid !== decoded.uid) {
-      return res.status(403).json({ error: "Non autorizzato su questo locale" });
-    }
-
-   // CONTROLLO ANTI-DOPPIO PAGAMENTO: Se ha già un abbonamento attivo, blocca!
+    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
     if (info.stripeSubscriptionId) {
-      return res.status(400).json({
-        error: "Hai già un abbonamento attivo. Usa il cambio piano invece di un nuovo checkout."
-      });
+      return res.status(400).json({ error: "Hai già un abbonamento attivo. Usa il cambio piano." });
     }
 
     const planSnap = await demasDb.collection("plans").doc(planId).get();
     if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
-
     const plan = planSnap.data();
     const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
-    if (!stripePriceId) {
-      return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
-    }
+    if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
 
     let stripeCustomerId = info.stripeCustomerId;
     if (!stripeCustomerId) {
@@ -1072,23 +1071,49 @@ app.post("/billing/create-checkout-session", async (req, res) => {
       await infoRef.update({ stripeCustomerId });
     }
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
+    // Serve l'indirizzo per Stripe Tax: qui non c'è uno step "billing_address_collection"
+    // come nel Checkout ospitato, quindi lo raccogliamo noi in-app prima di questa chiamata.
+    // Nota: i nomi dei campi devono essere ESATTAMENTE quelli richiesti da Stripe.
+    if (indirizzo?.country && indirizzo?.postal_code) {
+      await stripe.customers.update(stripeCustomerId, {
+        address: {
+          country: indirizzo.country,       // es. "IT"
+          postal_code: indirizzo.postal_code, // es. "00071"
+          city: indirizzo.city || undefined,
+          line1: indirizzo.line1 || undefined,
+          state: indirizzo.state || undefined,
+        },
+      });
+    }
+
+    const ephemeralKey = await stripe.ephemeralKeys.create(
+      { customer: stripeCustomerId },
+      { apiVersion: "2026-05-27.dahlia" } // stessa versione usata dal resto del backend
+    );
+
+    const subscription = await stripe.subscriptions.create({
       customer: stripeCustomerId,
-      line_items: [{ price: stripePriceId, quantity: 1 }],
-      success_url: `${process.env.DEMAS_APP_BASE_URL}/piani?checkout=success`,
-      cancel_url: `${process.env.DEMAS_APP_BASE_URL}/piani?checkout=cancel`,
+      items: [{ price: stripePriceId }],
+      payment_behavior: "default_incomplete",
+      payment_settings: { save_default_payment_method: "on_subscription" },
+      automatic_tax: { enabled: true },
+      expand: ["latest_invoice.payment_intent"],
       metadata: { barId, planId, ciclo: cicloScelto },
     });
 
-    res.json({ url: session.url });
+    const paymentIntent = subscription.latest_invoice.payment_intent;
+
+    res.json({
+      paymentIntentClientSecret: paymentIntent.client_secret,
+      ephemeralKey: ephemeralKey.secret,
+      customerId: stripeCustomerId,
+      subscriptionId: subscription.id, // utile per rollback se l'utente annulla il pagamento
+    });
   } catch (err) {
-    console.error("❌ Errore create-checkout-session:", err);
-    res.status(500).json({ error: "Errore creazione sessione di pagamento" });
+    console.error("❌ Errore create-payment-sheet:", err);
+    res.status(500).json({ error: "Errore creazione pagamento" });
   }
 });
-
-
 /* =========================
    BILLING — CAMBIA PIANO (abbonamento già attivo)
    POST /billing/change-plan
@@ -1138,6 +1163,69 @@ app.post("/billing/change-plan", async (req, res) => {
   } catch (err) {
     console.error("❌ Errore change-plan:", err);
     res.status(500).json({ error: "Errore cambio piano" });
+  }
+});
+
+
+/* =========================
+   BILLING — ANTEPRIMA COSTO CAMBIO PIANO (pro-rata)
+   POST /billing/preview-plan-change
+   Body: { token, barId, planId, ciclo }
+   Non modifica nulla: sola lettura, mostra all'utente cosa pagherebbe oggi.
+========================= */
+app.post("/billing/preview-plan-change", async (req, res) => {
+  try {
+    const { token, barId, planId, ciclo } = req.body;
+    if (!token) return res.status(401).json({ error: "Utente non autenticato" });
+
+    const cicloScelto = ciclo === "annuale" ? "annuale" : "mensile";
+    const decoded = await demasApp.auth().verifyIdToken(token);
+    if (!barId || !planId) return res.status(400).json({ error: "barId o planId mancante" });
+
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const infoSnap = await infoRef.get();
+    if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
+
+    const info = infoSnap.data();
+    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    if (!info.stripeSubscriptionId) return res.status(400).json({ error: "Nessun abbonamento attivo" });
+
+    const planSnap = await demasDb.collection("plans").doc(planId).get();
+    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
+    const plan = planSnap.data();
+    const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
+    if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
+
+    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    const itemId = subscription.items.data[0].id;
+
+    // sola anteprima: nessuna scrittura su Stripe né su Firestore
+    const preview = await stripe.invoices.createPreview({
+      customer: info.stripeCustomerId,
+      subscription: info.stripeSubscriptionId,
+      subscription_details: {
+        items: [{ id: itemId, price: stripePriceId }],
+        proration_behavior: "create_prorations",
+      },
+      automatic_tax: { enabled: true },
+    });
+
+    // Isoliamo solo le righe di proration per mostrarle in chiaro all'utente
+    const righeProrata = preview.lines.data
+      .filter((l) => l.parent?.subscription_item_details?.proration === true)
+      .map((l) => ({ descrizione: l.description, importo: l.amount / 100 }));
+
+    res.json({
+      dovutoOggi: preview.amount_due / 100,
+      imponibile: preview.subtotal / 100,
+      iva: (preview.total - preview.subtotal) / 100,
+      totale: preview.total / 100,
+      valuta: preview.currency,
+      righeProrata,
+    });
+  } catch (err) {
+    console.error("❌ Errore preview-plan-change:", err);
+    res.status(500).json({ error: "Errore nel calcolo dell'anteprima" });
   }
 });
 /* =========================
