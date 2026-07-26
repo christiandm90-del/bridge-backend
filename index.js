@@ -1018,6 +1018,7 @@ async function findPlanByStripePriceId(priceId) {
    POST /billing/create-checkout-session
    Body: { token, barId, planId }
 ========================= */
+// 1. MODIFICA LA CREAZIONE DEL CHECKOUT (Blocca pagamenti multipli se attivo)
 app.post("/billing/create-checkout-session", async (req, res) => {
   try {
     const { token, barId, planId, ciclo } = req.body;
@@ -1034,6 +1035,13 @@ app.post("/billing/create-checkout-session", async (req, res) => {
     const info = infoSnap.data();
     if (info.uid !== decoded.uid) {
       return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    }
+
+    // CONTROLLO ANTI-DOPPIO PAGAMENTO: Se ha già un abbonamento attivo, blocca!
+    if (info.piano && info.piano.stripeSubscriptionId && info.piano.tipo !== "freeplan") {
+      return res.status(400).json({ 
+        error: "Hai già un abbonamento attivo. Gestisci o cambia il piano esistente anziché crearne uno nuovo." 
+      });
     }
 
     const planSnap = await demasDb.collection("plans").doc(planId).get();
@@ -1070,6 +1078,54 @@ app.post("/billing/create-checkout-session", async (req, res) => {
     console.error("❌ Errore create-checkout-session:", err);
     res.status(500).json({ error: "Errore creazione sessione di pagamento" });
   }
+});
+
+// 2. AGGIUNGI IL WEBHOOK DI STRIPE (Aggiorna Firestore in automatico)
+app.post("/billing/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("⚠️ Errore firma webhook Stripe:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const { barId, planId, ciclo } = session.metadata || {};
+
+    if (barId && planId) {
+      const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+      
+      // Recupera i dettagli dell'abbonamento da Stripe per avere la data di rinnovo
+      const subscriptionId = session.subscription;
+      let subscriptionData = {};
+      
+      if (subscriptionId) {
+        const sub = await stripe.subscriptions.retrieve(subscriptionId);
+        subscriptionData = {
+          stripeSubscriptionId: subscriptionId,
+          rinnovoIl: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null,
+        };
+      }
+
+      // Aggiorna il database del locale
+      await infoRef.update({
+        "piano.tipo": planId,
+        "piano.ciclo": ciclo || "mensile",
+        "piano.personalizzato": false,
+        "piano.aggiornatoIl": Date.now(),
+        "piano.aggiornatoDa": "stripe_webhook",
+        ...subscriptionData,
+      });
+
+      console.log(`✅ Abbonamento aggiornato con successo per il bar ${barId} al piano ${planId}`);
+    }
+  }
+
+  res.json({ received: true });
 });
 /* =========================
    BILLING — CAMBIA PIANO (abbonamento già attivo)
