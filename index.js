@@ -1146,51 +1146,90 @@ app.post("/billing/change-plan", async (req, res) => {
     if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
 
     const info = infoSnap.data();
-    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    if (info.uid !== decoded.uid) {
+      return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    }
 
-    // Gestione passaggio a Free
-    if (planId === "free" || planId === "freeplan") {
-      if (info.stripeSubscriptionId) {
-        const sub = await stripe.subscriptions.update(info.stripeSubscriptionId, { cancel_at_period_end: true });
-        await infoRef.update({
-          "piano.cancellazionePendente": true,
-          "piano.cancellaIl": sub.cancel_at ? admin.firestore.Timestamp.fromMillis(sub.cancel_at * 1000) : null,
-        });
-      } else {
-        await applyPlanToBar(barId, planId, "manual_free", cicloScelto);
+    // Se sceglie il piano gratuito, disdici l'abbonamento Stripe se presente o passa a free
+    if (planId === "freeplan") {
+      if (info.piano?.stripeSubscriptionId) {
+        await stripe.subscriptions.cancel(info.piano.stripeSubscriptionId);
       }
-      return res.json({ success: true, mode: "free" });
+      await infoRef.update({
+        "piano.tipo": "freeplan",
+        "piano.stripeSubscriptionId": null,
+        "piano.ciclo": null,
+        "piano.aggiornatoIl": Date.now(),
+        "piano.aggiornatoDa": "user_downgrade"
+      });
+      return res.json({ success: true });
     }
 
-    // Se NON ha ancora un abbonamento Stripe, DEVE usare checkout
-    if (!info.stripeSubscriptionId) {
-      return res.status(400).json({ error: "REQUIRES_CHECKOUT", message: "Nessun abbonamento Stripe attivo." });
-    }
-
+    // Preleva il nuovo piano dal DB
     const planSnap = await demasDb.collection("plans").doc(planId).get();
-    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato in Firestore" });
-    
+    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
+
     const plan = planSnap.data();
     const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
-    if (!stripePriceId) return res.status(400).json({ error: "stripePriceId assente per questo ciclo" });
+    if (!stripePriceId) {
+      return res.status(400).json({ error: "Prezzo non configurato per questo ciclo" });
+    }
 
-    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
-    const itemId = subscription.items.data[0].id;
+    const subscriptionId = info.piano?.stripeSubscriptionId;
 
-    await stripe.subscriptions.update(info.stripeSubscriptionId, {
-      items: [{ id: itemId, price: stripePriceId }],
-      proration_behavior: "create_prorations",
-      cancel_at_period_end: false,
+    // SE HA GIÀ UN ABBONAMENTO ATTIVO: Aggiorna l'abbonamento esistente (Upgrade/Downgrade immediato con pro-rata)
+    if (subscriptionId) {
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+      const subscriptionItemKey = subscription.items.data[0].id;
+
+      await stripe.subscriptions.update(subscriptionId, {
+        cancel_at_period_end: false,
+        proration_behavior: 'create_prorations',
+        items: [{
+          id: subscriptionItemKey,
+          price: stripePriceId,
+        }],
+      });
+
+      // Aggiorna subito Firestore
+      await infoRef.update({
+        "piano.tipo": planId,
+        "piano.ciclo": cicloScelto,
+        "piano.aggiornatoIl": Date.now(),
+        "piano.aggiornatoDa": "stripe_update"
+      });
+
+      return res.json({ success: true, message: "Piano aggiornato con successo" });
+    }
+
+    // SE NON HA UN ABBONAMENTO ATTIVO: Crea una nuova sessione Stripe Checkout
+    let stripeCustomerId = info.stripeCustomerId;
+    if (!stripeCustomerId) {
+      const customer = await stripe.customers.create({
+        email: info.email || undefined,
+        name: info.companyName || undefined,
+        metadata: { barId },
+      });
+      stripeCustomerId = customer.id;
+      await infoRef.update({ stripeCustomerId });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: stripeCustomerId,
+      line_items: [{ price: stripePriceId, quantity: 1 }],
+      success_url: `${process.env.DEMAS_APP_BASE_URL}/piani?checkout=success`,
+      cancel_url: `${process.env.DEMAS_APP_BASE_URL}/piani?checkout=cancel`,
       metadata: { barId, planId, ciclo: cicloScelto },
     });
 
-    res.json({ success: true, mode: "updated" });
+    res.json({ url: session.url });
+
   } catch (err) {
-    console.error("❌ Errore change-plan:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ Errore cambio piano:", err);
+    res.status(500).json({ error: err.message || "Errore durante il cambio piano" });
   }
 });
-
 /* =========================
    BILLING — ANNULLA ABBONAMENTO (torna a Free a fine periodo già pagato)
    POST /billing/cancel-subscription
