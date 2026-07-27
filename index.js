@@ -1345,10 +1345,17 @@ app.post("/billing/preview-plan-change", async (req, res) => {
       automatic_tax: { enabled: true },
     });
 
-    // Isoliamo solo le righe di proration per mostrarle in chiaro all'utente
-    const righeProrata = preview.lines.data
-      .filter((l) => l.parent?.subscription_item_details?.proration === true)
-      .map((l) => ({ descrizione: l.description, importo: l.amount / 100 }));
+// Mostriamo TUTTE le righe, non solo quelle di proration del cambio
+    // corrente — se ci sono voci pendenti residue da un problema precedente,
+    // l'utente deve vederle, non scoprire un totale più alto di quanto mostrato.
+    const righeProrata = preview.lines.data.map((l) => ({
+      descrizione: l.description,
+      importo: l.amount / 100,
+      èProrationDiQuestoCambio: l.parent?.subscription_item_details?.proration === true,
+    }));
+
+    const sommaRighe = righeProrata.reduce((s, r) => s + r.importo, 0);
+    const sommaNonCollimante = Math.abs(sommaRighe - preview.subtotal / 100) > 0.01;
 
     res.json({
       dovutoOggi: preview.amount_due / 100,
@@ -1357,6 +1364,9 @@ app.post("/billing/preview-plan-change", async (req, res) => {
       totale: preview.total / 100,
       valuta: preview.currency,
       righeProrata,
+      // Segnale per il frontend: se true, c'è qualcosa di residuo/anomalo
+      // da investigare manualmente su Stripe prima di far confermare l'utente.
+      anomaliaRilevata: sommaNonCollimante,
     });
 } catch (err) {
     console.error("❌ Errore preview-plan-change:", err);
