@@ -1253,9 +1253,9 @@ app.post("/billing/change-plan", async (req, res) => {
 
 
 
-    await stripe.subscriptions.update(info.stripeSubscriptionId, {
+await stripe.subscriptions.update(info.stripeSubscriptionId, {
       items: [{ id: itemId, price: stripePriceId }],
-      proration_behavior: "create_prorations",
+      proration_behavior: "always_invoice", // fattura subito il conguaglio pro-rata, invece di accodarlo al rinnovo naturale (che su un piano annuale può essere tra mesi)
       cancel_at_period_end: false,
       metadata: { barId, planId, ciclo: cicloScelto },
     });
@@ -1335,12 +1335,12 @@ app.post("/billing/preview-plan-change", async (req, res) => {
 
 
     // sola anteprima: nessuna scrittura su Stripe né su Firestore
-    const preview = await stripe.invoices.createPreview({
+const preview = await stripe.invoices.createPreview({
       customer: info.stripeCustomerId,
       subscription: info.stripeSubscriptionId,
       subscription_details: {
         items: [{ id: itemId, price: stripePriceId }],
-        proration_behavior: "create_prorations",
+        proration_behavior: "always_invoice", // deve rispecchiare esattamente cosa farà change-plan
       },
       automatic_tax: { enabled: true },
     });
