@@ -1022,6 +1022,31 @@ async function findPlanByStripePriceId(priceId) {
 
   return null;
 }
+
+
+
+/**
+ * Regole di transizione piano, per evitare downgrade e cambi
+ * annuale→mensile che causano riprorazioni incrociate scorrette:
+ * - stesso ciclo: consentito SOLO upgrade (livello target > livello attuale)
+ * - mensile → annuale: sempre consentito, qualsiasi livello
+ * - annuale → mensile: MAI consentito
+ */
+function transizioneConsentita(livelloAttuale, cicloAttuale, livelloTarget, cicloTarget) {
+  if (cicloAttuale === "annuale" && cicloTarget === "mensile") {
+    return { ok: false, motivo: "Non è possibile passare da un piano annuale a uno mensile. Disdici l'abbonamento annuale e attivane uno nuovo mensile a fine periodo." };
+  }
+  if (cicloAttuale === cicloTarget) {
+    if (livelloTarget <= livelloAttuale) {
+      return { ok: false, motivo: "Il cambio piano online supporta solo upgrade a un piano superiore. Per un downgrade, disdici e riattiva un nuovo piano." };
+    }
+    return { ok: true };
+  }
+  // mensile → annuale: sempre ok
+  return { ok: true };
+}
+
+
 // Nelle API Stripe recenti current_period_end è sui subscription items,
 // non più sulla subscription stessa — proviamo entrambi i posti.
 function getCurrentPeriodEnd(subscription) {
@@ -1196,11 +1221,37 @@ app.post("/billing/change-plan", async (req, res) => {
     const planSnap = await demasDb.collection("plans").doc(planId).get();
     if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
     const plan = planSnap.data();
+
+// Verifica coerenza subscription: se ha più di un item, qualcosa non va —
+    // meglio bloccare con un errore chiaro che riprorazionare dati sporchi.
+    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    if (subscription.items.data.length !== 1) {
+      return res.status(409).json({
+        error: "Abbonamento in stato inconsistente (più voci attive). Contatta l'assistenza prima di procedere.",
+      });
+    }
+    const itemId = subscription.items.data[0].id;
+    const priceAttualeId = subscription.items.data[0].price.id;
+
+    const pianoAttualeTrovato = await findPlanByStripePriceId(priceAttualeId);
+    if (!pianoAttualeTrovato) {
+      return res.status(409).json({ error: "Piano attuale non riconosciuto nel catalogo." });
+    }
+
+    const planAttualeSnap = await demasDb.collection("plans").doc(pianoAttualeTrovato.planId).get();
+    const livelloAttuale = planAttualeSnap.data()?.livello ?? 0;
+    const livelloTarget = plan.livello ?? 0;
+
+    const check = transizioneConsentita(livelloAttuale, pianoAttualeTrovato.ciclo, livelloTarget, cicloScelto);
+    if (!check.ok) {
+      return res.status(400).json({ error: check.motivo });
+    }
+
+
     const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
     if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
 
-    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
-    const itemId = subscription.items.data[0].id;
+
 
     await stripe.subscriptions.update(info.stripeSubscriptionId, {
       items: [{ id: itemId, price: stripePriceId }],
@@ -1214,17 +1265,16 @@ app.post("/billing/change-plan", async (req, res) => {
     // customer.subscription.updated — non scriviamo Firestore qui per evitare
     // di bypassare il ricalcolo di zoneConfig fatto da applyPlanToBar.
 } catch (err) {
-    console.error("❌ Errore preview-plan-change:", err);
+    console.error("❌ Errore change-plan:", err);
     if (isStripeTaxLocationError(err)) {
       return res.status(422).json({
         error: "indirizzo_richiesto",
         message: "Serve l'indirizzo di fatturazione per calcolare l'IVA prima di procedere.",
       });
     }
-    res.status(500).json({ error: "Errore nel calcolo dell'anteprima" });
+    res.status(500).json({ error: "Errore cambio piano" });
   }
 });
-
 
 /* =========================
    BILLING — ANTEPRIMA COSTO CAMBIO PIANO (pro-rata)
@@ -1252,11 +1302,37 @@ app.post("/billing/preview-plan-change", async (req, res) => {
     const planSnap = await demasDb.collection("plans").doc(planId).get();
     if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
     const plan = planSnap.data();
+
+    // Verifica coerenza subscription: se ha più di un item, qualcosa non va —
+    // meglio bloccare con un errore chiaro che riprorazionare dati sporchi.
+    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    if (subscription.items.data.length !== 1) {
+      return res.status(409).json({
+        error: "Abbonamento in stato inconsistente (più voci attive). Contatta l'assistenza prima di procedere.",
+      });
+    }
+    const itemId = subscription.items.data[0].id;
+    const priceAttualeId = subscription.items.data[0].price.id;
+
+    const pianoAttualeTrovato = await findPlanByStripePriceId(priceAttualeId);
+    if (!pianoAttualeTrovato) {
+      return res.status(409).json({ error: "Piano attuale non riconosciuto nel catalogo." });
+    }
+
+    const planAttualeSnap = await demasDb.collection("plans").doc(pianoAttualeTrovato.planId).get();
+    const livelloAttuale = planAttualeSnap.data()?.livello ?? 0;
+    const livelloTarget = plan.livello ?? 0;
+
+    const check = transizioneConsentita(livelloAttuale, pianoAttualeTrovato.ciclo, livelloTarget, cicloScelto);
+    if (!check.ok) {
+      return res.status(400).json({ error: check.motivo });
+    }
+
+
     const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
     if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
 
-    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
-    const itemId = subscription.items.data[0].id;
+
 
     // sola anteprima: nessuna scrittura su Stripe né su Firestore
     const preview = await stripe.invoices.createPreview({
