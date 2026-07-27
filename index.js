@@ -1029,7 +1029,15 @@ function getCurrentPeriodEnd(subscription) {
   return subscription.items?.data?.[0]?.current_period_end ?? null;
 }
 
-
+// Rileva se l'errore Stripe è dovuto a Stripe Tax senza indirizzo cliente,
+// per distinguerlo da altri errori e permettere al frontend di reagire.
+function isStripeTaxLocationError(err) {
+  return (
+    err?.code === "customer_tax_location_invalid" ||
+    /tax location/i.test(err?.message || "") ||
+    /customer.*address/i.test(err?.message || "")
+  );
+}
 /* =========================
    BILLING — PAYMENT SHEET (primo acquisto, nativo Capacitor)
    POST /billing/create-payment-sheet
@@ -1114,6 +1122,51 @@ app.post("/billing/create-payment-sheet", async (req, res) => {
     res.status(500).json({ error: "Errore creazione pagamento" });
   }
 });
+
+
+/* =========================
+   BILLING — SALVA INDIRIZZO DI FATTURAZIONE
+   POST /billing/update-billing-address
+   Body: { token, barId, indirizzo: { country, postal_code, city?, line1?, state? } }
+========================= */
+app.post("/billing/update-billing-address", async (req, res) => {
+  try {
+    const { token, barId, indirizzo } = req.body;
+    if (!token) return res.status(401).json({ error: "Utente non autenticato" });
+    const decoded = await demasApp.auth().verifyIdToken(token);
+    if (!barId) return res.status(400).json({ error: "barId mancante" });
+    if (!indirizzo?.country || !indirizzo?.postal_code) {
+      return res.status(400).json({ error: "Indirizzo incompleto (paese e CAP obbligatori)" });
+    }
+
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const infoSnap = await infoRef.get();
+    if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
+
+    const info = infoSnap.data();
+    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    if (!info.stripeCustomerId) return res.status(400).json({ error: "Cliente Stripe non ancora creato" });
+
+    await stripe.customers.update(info.stripeCustomerId, {
+      address: {
+        country: indirizzo.country,
+        postal_code: indirizzo.postal_code,
+        city: indirizzo.city || undefined,
+        line1: indirizzo.line1 || undefined,
+        state: indirizzo.state || undefined,
+      },
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Errore update-billing-address:", err);
+    res.status(500).json({ error: "Errore salvataggio indirizzo" });
+  }
+});
+
+
+
+
 /* =========================
    BILLING — CAMBIA PIANO (abbonamento già attivo)
    POST /billing/change-plan
@@ -1160,9 +1213,15 @@ app.post("/billing/change-plan", async (req, res) => {
     // L'applicazione vera e propria (piano + zoneConfig) arriva dal webhook
     // customer.subscription.updated — non scriviamo Firestore qui per evitare
     // di bypassare il ricalcolo di zoneConfig fatto da applyPlanToBar.
-  } catch (err) {
-    console.error("❌ Errore change-plan:", err);
-    res.status(500).json({ error: "Errore cambio piano" });
+} catch (err) {
+    console.error("❌ Errore preview-plan-change:", err);
+    if (isStripeTaxLocationError(err)) {
+      return res.status(422).json({
+        error: "indirizzo_richiesto",
+        message: "Serve l'indirizzo di fatturazione per calcolare l'IVA prima di procedere.",
+      });
+    }
+    res.status(500).json({ error: "Errore nel calcolo dell'anteprima" });
   }
 });
 
@@ -1223,8 +1282,14 @@ app.post("/billing/preview-plan-change", async (req, res) => {
       valuta: preview.currency,
       righeProrata,
     });
-  } catch (err) {
+} catch (err) {
     console.error("❌ Errore preview-plan-change:", err);
+    if (isStripeTaxLocationError(err)) {
+      return res.status(422).json({
+        error: "indirizzo_richiesto",
+        message: "Serve l'indirizzo di fatturazione per calcolare l'IVA prima di procedere.",
+      });
+    }
     res.status(500).json({ error: "Errore nel calcolo dell'anteprima" });
   }
 });
