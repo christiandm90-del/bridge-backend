@@ -507,6 +507,47 @@ function verificaCoerenzaGeografica({ paeseDichiarato, ip, gpsPaese }) {
 }); 
   
   */}
+/* =========================
+   BILLING — SINCRONIZZA PIANO (recovery/safety-net)
+   POST /billing/sync-plan
+   Rilegge lo stato reale della subscription da Stripe e applica il piano
+   se risulta attiva — usalo sia come recovery manuale sia come chiamata
+   automatica subito dopo un pagamento riuscito, senza dipendere solo dal webhook.
+========================= */
+app.post("/billing/sync-plan", async (req, res) => {
+  try {
+    const { token, barId } = req.body;
+    if (!token) return res.status(401).json({ error: "Utente non autenticato" });
+    const decoded = await demasApp.auth().verifyIdToken(token);
+    if (!barId) return res.status(400).json({ error: "barId mancante" });
+
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const infoSnap = await infoRef.get();
+    if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
+
+    const info = infoSnap.data();
+    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    if (!info.stripeSubscriptionId) return res.status(400).json({ error: "Nessun abbonamento da sincronizzare" });
+
+    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    const priceId = subscription.items?.data?.[0]?.price?.id;
+
+    if (subscription.status === "active" && priceId) {
+      const trovato = await findPlanByStripePriceId(priceId);
+      if (trovato) {
+        await infoRef.update({ "piano.pagamentoInSospeso": admin.firestore.FieldValue.delete() });
+        await applyPlanToBar(barId, trovato.planId, "manual-sync", trovato.ciclo);
+        return res.json({ success: true, planId: trovato.planId, status: subscription.status });
+      }
+      return res.status(409).json({ error: "Piano Stripe non riconosciuto nel catalogo" });
+    }
+
+    res.json({ success: false, status: subscription.status });
+  } catch (err) {
+    console.error("❌ Errore sync-plan:", err);
+    res.status(500).json({ error: "Errore sincronizzazione piano" });
+  }
+});
 
 app.post("/create-payment-intent", async (req, res) => {
   try {
