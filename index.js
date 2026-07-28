@@ -75,47 +75,58 @@ app.post(
           break;
         }
 
-    case "customer.subscription.updated": {
-          const subscription = event.data.object;
-          const priceId = subscription.items?.data?.[0]?.price?.id;
-          const customerId = subscription.customer;
+case "customer.subscription.updated": {
+  const subscription = event.data.object;
+  const priceId = subscription.items?.data?.[0]?.price?.id;
+  const customerId = subscription.customer;
 
-          const barsSnap = await demasDb
-            .collectionGroup("meta")
-            .where("stripeCustomerId", "==", customerId)
-            .limit(1)
-            .get();
+  const barsSnap = await demasDb
+    .collectionGroup("meta")
+    .where("stripeCustomerId", "==", customerId)
+    .limit(1)
+    .get();
 
-          if (!barsSnap.empty) {
-            const barId = barsSnap.docs[0].ref.parent.parent.id;
+  if (!barsSnap.empty) {
+    const barId = barsSnap.docs[0].ref.parent.parent.id;
+    const barData = barsSnap.docs[0].data();
 
-            const periodEnd = getCurrentPeriodEnd(subscription);
-            await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
-              "piano.cancellazionePendente": subscription.cancel_at_period_end === true,
-              "piano.cancellaIl": subscription.cancel_at
-                ? admin.firestore.Timestamp.fromMillis(subscription.cancel_at * 1000)
-                : null,
-              "piano.rinnovoIl": periodEnd
-                ? admin.firestore.Timestamp.fromMillis(periodEnd * 1000)
-                : null,
-            });
+    // Pagamento mai completato/abbandonato: liberiamo il riferimento per permettere
+    // un nuovo tentativo, invece di lasciare l'utente bloccato per sempre.
+    if (["incomplete_expired", "canceled"].includes(subscription.status)) {
+      if (barData.stripeSubscriptionId === subscription.id) {
+        await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
+          stripeSubscriptionId: admin.firestore.FieldValue.delete(),
+          "piano.pagamentoInSospeso": admin.firestore.FieldValue.delete(),
+        });
+      }
+      break;
+    }
 
-            if (subscription.status === "active" && priceId) {
-              const trovato = await findPlanByStripePriceId(priceId);
-              if (trovato) {
-                // Se stripeSubscriptionId non è ancora salvato (primo acquisto via Payment Sheet,
-                // che non passa da nessuna Checkout Session), lo salviamo qui.
-                if (!barsSnap.docs[0].data().stripeSubscriptionId) {
-                  await demasDb.collection("bars").doc(barId).collection("meta").doc("info")
-                    .update({ stripeSubscriptionId: subscription.id });
-                }
-                // SEMPRE eseguito — è quello che applica il nuovo piano dopo /billing/change-plan
-                await applyPlanToBar(barId, trovato.planId, "stripe-webhook", trovato.ciclo);
-              }
-            }
-          }
-          break;
-        }case "customer.tax_id.updated": {
+    const periodEnd = getCurrentPeriodEnd(subscription);
+    await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
+      "piano.cancellazionePendente": subscription.cancel_at_period_end === true,
+      "piano.cancellaIl": subscription.cancel_at
+        ? admin.firestore.Timestamp.fromMillis(subscription.cancel_at * 1000)
+        : null,
+      "piano.rinnovoIl": periodEnd
+        ? admin.firestore.Timestamp.fromMillis(periodEnd * 1000)
+        : null,
+    });
+
+    if (subscription.status === "active" && priceId) {
+      const trovato = await findPlanByStripePriceId(priceId);
+      if (trovato) {
+        await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
+          stripeSubscriptionId: subscription.id,
+          "piano.pagamentoInSospeso": admin.firestore.FieldValue.delete(),
+        });
+        await applyPlanToBar(barId, trovato.planId, "stripe-webhook", trovato.ciclo);
+      }
+    }
+  }
+  break;
+}
+        case "customer.tax_id.updated": {
   const taxId = event.data.object;
   if (taxId.verification?.status === "unverified") {
     const barsSnap = await demasDb
@@ -1154,8 +1165,40 @@ app.post("/billing/create-payment-sheet", async (req, res) => {
 
     const info = infoSnap.data();
     if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+
+    // Se esiste già un riferimento, verifichiamo lo STATO REALE su Stripe prima di
+    // bloccare o duplicare: "incomplete" va ripreso, scaduta/cancellata va liberata,
+    // solo una davvero attiva blocca il nuovo acquisto.
     if (info.stripeSubscriptionId) {
-      return res.status(400).json({ error: "Hai già un abbonamento attivo. Usa il cambio piano." });
+      const esistente = await stripe.subscriptions
+        .retrieve(info.stripeSubscriptionId, {
+          expand: ["latest_invoice.confirmation_secret", "pending_setup_intent"],
+        })
+        .catch(() => null);
+
+      if (esistente && ["active", "trialing", "past_due", "unpaid"].includes(esistente.status)) {
+        return res.status(400).json({ error: "Hai già un abbonamento attivo. Usa il cambio piano." });
+      }
+
+      if (esistente && esistente.status === "incomplete") {
+        const ephemeralKeyRetry = await stripe.ephemeralKeys.create(
+          { customer: esistente.customer },
+          { apiVersion: "2026-05-27.dahlia" }
+        );
+        const clientSecretRetry = esistente.pending_setup_intent
+          ? esistente.pending_setup_intent.client_secret
+          : esistente.latest_invoice.confirmation_secret.client_secret;
+
+        return res.json({
+          paymentIntentClientSecret: clientSecretRetry,
+          ephemeralKey: ephemeralKeyRetry.secret,
+          customerId: esistente.customer,
+          subscriptionId: esistente.id,
+        });
+      }
+
+      // canceled / incomplete_expired / non trovata su Stripe: liberiamo il riferimento
+      await infoRef.update({ stripeSubscriptionId: admin.firestore.FieldValue.delete() });
     }
 
     const planSnap = await demasDb.collection("plans").doc(planId).get();
@@ -1175,14 +1218,11 @@ app.post("/billing/create-payment-sheet", async (req, res) => {
       await infoRef.update({ stripeCustomerId });
     }
 
-    // Serve l'indirizzo per Stripe Tax: qui non c'è uno step "billing_address_collection"
-    // come nel Checkout ospitato, quindi lo raccogliamo noi in-app prima di questa chiamata.
-    // Nota: i nomi dei campi devono essere ESATTAMENTE quelli richiesti da Stripe.
     if (indirizzo?.country && indirizzo?.postal_code) {
       await stripe.customers.update(stripeCustomerId, {
         address: {
-          country: indirizzo.country,       // es. "IT"
-          postal_code: indirizzo.postal_code, // es. "00071"
+          country: indirizzo.country,
+          postal_code: indirizzo.postal_code,
           city: indirizzo.city || undefined,
           line1: indirizzo.line1 || undefined,
           state: indirizzo.state || undefined,
@@ -1190,68 +1230,79 @@ app.post("/billing/create-payment-sheet", async (req, res) => {
       });
     }
 
-// P.IVA (se fornita): Stripe la verifica su VIES in modo asincrono
-if (indirizzo?.piva) {
-  try {
-    await stripe.customers.createTaxId(stripeCustomerId, {
-      type: "eu_vat",
-      value: indirizzo.piva,
+    // Verifica che il customer Stripe abbia REALMENTE un indirizzo salvato prima di
+    // procedere: se manca, alcune configurazioni di Stripe Tax calcolano IVA a 0
+    // invece di dare errore — meglio bloccare qui in modo esplicito.
+    const customerCorrente = await stripe.customers.retrieve(stripeCustomerId);
+    if (!customerCorrente.address?.country || !customerCorrente.address?.postal_code) {
+      return res.status(422).json({
+        error: "indirizzo_richiesto",
+        message: "Serve l'indirizzo di fatturazione per calcolare l'IVA prima di procedere.",
+      });
+    }
+
+    if (indirizzo?.piva) {
+      try {
+        await stripe.customers.createTaxId(stripeCustomerId, { type: "eu_vat", value: indirizzo.piva });
+      } catch (err) {
+        console.error("⚠️ P.IVA non valida:", err.message);
+      }
+    }
+
+    const ipCliente = estraiIpReale(req);
+    const gpsPaese = await paeseDaCoordinate(req.body.gps?.lat, req.body.gps?.lng);
+    const coerenza = verificaCoerenzaGeografica({
+      paeseDichiarato: indirizzo?.country || customerCorrente.address.country,
+      ip: ipCliente,
+      gpsPaese,
     });
-  } catch (err) {
-    console.error("⚠️ P.IVA non valida:", err.message);
-    // non blocchiamo qui: l'esito arriva async via webhook customer.tax_id.updated
-  }
-}
 
-// Prova incrociata di localizzazione: IP + GPS realtime (se il client l'ha inviato)
-const ipCliente = estraiIpReale(req);
-const gpsPaese = await paeseDaCoordinate(req.body.gps?.lat, req.body.gps?.lng);
-const coerenza = verificaCoerenzaGeografica({
-  paeseDichiarato: indirizzo?.country || null,
-  ip: ipCliente,
-  gpsPaese,
-});
-
-await infoRef.update({
-  "billing.provaLocalizzazione": coerenza,
-  "billing.daVerificare": coerenza.anomaliaRilevata,
-});
-
-if (coerenza.anomaliaRilevata) {
-  console.warn(`⚠️ Anomalia geografica locale ${barId}:`, coerenza);
-}
-
+    await infoRef.update({
+      "billing.provaLocalizzazione": coerenza,
+      "billing.daVerificare": coerenza.anomaliaRilevata,
+    });
+    if (coerenza.anomaliaRilevata) console.warn(`⚠️ Anomalia geografica locale ${barId}:`, coerenza);
 
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: stripeCustomerId },
-      { apiVersion: "2026-05-27.dahlia" } // stessa versione usata dal resto del backend
+      { apiVersion: "2026-05-27.dahlia" }
     );
 
-const subscription = await stripe.subscriptions.create({
-  customer: stripeCustomerId,
-  items: [{ price: stripePriceId }],
-  payment_behavior: "default_incomplete",
-  payment_settings: { save_default_payment_method: "on_subscription" },
-  automatic_tax: { enabled: true },
-  expand: ["latest_invoice.confirmation_secret", "pending_setup_intent"], // ← era latest_invoice.payment_intent
-  metadata: { barId, planId, ciclo: cicloScelto },
-});
+    const subscription = await stripe.subscriptions.create({
+      customer: stripeCustomerId,
+      items: [{ price: stripePriceId }],
+      payment_behavior: "default_incomplete",
+      payment_settings: { save_default_payment_method: "on_subscription" },
+      automatic_tax: { enabled: true },
+      expand: ["latest_invoice.confirmation_secret", "pending_setup_intent"],
+      metadata: { barId, planId, ciclo: cicloScelto },
+    });
 
-// Copre anche il caso trial/setup senza addebito immediato
-const clientSecret = subscription.pending_setup_intent
-  ? subscription.pending_setup_intent.client_secret
-  : subscription.latest_invoice.confirmation_secret.client_secret;
+    // Salvato SUBITO, prima che il pagamento sia confermato: chiude la finestra in
+    // cui l'utente poteva pagare due volte lo stesso piano prima del webhook.
+    // L'applicazione del piano resta comunque compito ESCLUSIVO del webhook
+    // customer.subscription.updated quando lo stato diventa "active".
+    await infoRef.update({
+      stripeSubscriptionId: subscription.id,
+      "piano.pagamentoInSospeso": true,
+    });
 
-res.json({
-  paymentIntentClientSecret: clientSecret,
-  ephemeralKey: ephemeralKey.secret,
-  customerId: stripeCustomerId,
-  subscriptionId: subscription.id,
-});
-  
+    const invoiceCreata = subscription.latest_invoice;
+    if (invoiceCreata && (!invoiceCreata.tax || invoiceCreata.tax === 0)) {
+      console.warn(`⚠️ IVA a 0 su invoice ${invoiceCreata.id} — barId ${barId}, indirizzo cliente:`, customerCorrente.address);
+    }
 
+    const clientSecret = subscription.pending_setup_intent
+      ? subscription.pending_setup_intent.client_secret
+      : subscription.latest_invoice.confirmation_secret.client_secret;
 
-} catch (err) {
+    res.json({
+      paymentIntentClientSecret: clientSecret,
+      ephemeralKey: ephemeralKey.secret,
+      customerId: stripeCustomerId,
+      subscriptionId: subscription.id,
+    });
+  } catch (err) {
     console.error("❌ Errore create-payment-sheet:", err);
     if (isStripeTaxLocationError(err)) {
       return res.status(422).json({
@@ -1262,7 +1313,6 @@ res.json({
     res.status(500).json({ error: "Errore creazione pagamento" });
   }
 });
-
 
 /* =========================
    BILLING — SALVA INDIRIZZO DI FATTURAZIONE
