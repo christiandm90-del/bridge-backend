@@ -1142,8 +1142,14 @@ app.post("/billing/create-payment-sheet", async (req, res) => {
       customerId: stripeCustomerId,
       subscriptionId: subscription.id, // utile per rollback se l'utente annulla il pagamento
     });
-  } catch (err) {
+} catch (err) {
     console.error("❌ Errore create-payment-sheet:", err);
+    if (isStripeTaxLocationError(err)) {
+      return res.status(422).json({
+        error: "indirizzo_richiesto",
+        message: "Serve l'indirizzo di fatturazione per calcolare l'IVA prima di procedere.",
+      });
+    }
     res.status(500).json({ error: "Errore creazione pagamento" });
   }
 });
