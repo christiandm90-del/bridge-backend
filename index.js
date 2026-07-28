@@ -1449,15 +1449,24 @@ app.post("/billing/change-plan", async (req, res) => {
 
 
 
-await stripe.subscriptions.update(info.stripeSubscriptionId, {
-      items: [{ id: itemId, price: stripePriceId }],
-      proration_behavior: "always_invoice", // fattura subito il conguaglio pro-rata, invece di accodarlo al rinnovo naturale (che su un piano annuale può essere tra mesi)
-  
-      cancel_at_period_end: false,
-      metadata: { barId, planId, ciclo: cicloScelto },
-    });
+const risultato = await stripe.subscriptions.update(info.stripeSubscriptionId, {
+  items: [{ id: itemId, price: stripePriceId }],
+  proration_behavior: "always_invoice",
+  payment_behavior: "pending_if_incomplete", // il piano cambia SOLO se il pagamento va a buon fine
+  cancel_at_period_end: false,
+  metadata: { barId, planId, ciclo: cicloScelto },
+});
 
-    res.json({ success: true });
+if (risultato.pending_update) {
+  // Il pagamento non è riuscito immediatamente: Stripe riproverà automaticamente.
+  // Il piano NON è ancora cambiato — resta quello attuale finché il pagamento non si conclude.
+  return res.status(402).json({
+    error: "pagamento_in_sospeso",
+    message: "Il pagamento non è andato a buon fine subito. Stripe riproverà automaticamente; il piano resterà quello attuale fino alla conferma del pagamento.",
+  });
+}
+
+res.json({ success: true });
     // L'applicazione vera e propria (piano + zoneConfig) arriva dal webhook
     // customer.subscription.updated — non scriviamo Firestore qui per evitare
     // di bypassare il ricalcolo di zoneConfig fatto da applyPlanToBar.
@@ -1542,10 +1551,7 @@ const preview = await stripe.invoices.createPreview({
       },
       automatic_tax: { enabled: true },
     });
-// DEBUG TEMPORANEO — rimuovi dopo aver diagnosticato
-console.log("DEBUG automatic_tax status:", JSON.stringify(preview.automatic_tax, null, 2));
-console.log("DEBUG subtotal/total:", preview.subtotal, preview.total);
-console.log("DEBUG riga completa:", JSON.stringify(preview.lines.data, null, 2));
+
 // Mostriamo TUTTE le righe, non solo quelle di proration del cambio
     // corrente — se ci sono voci pendenti residue da un problema precedente,
     // l'utente deve vederle, non scoprire un totale più alto di quanto mostrato.
