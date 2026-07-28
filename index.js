@@ -1452,7 +1452,7 @@ app.post("/billing/change-plan", async (req, res) => {
 await stripe.subscriptions.update(info.stripeSubscriptionId, {
       items: [{ id: itemId, price: stripePriceId }],
       proration_behavior: "always_invoice", // fattura subito il conguaglio pro-rata, invece di accodarlo al rinnovo naturale (che su un piano annuale può essere tra mesi)
-      billing_mode: { type: "flexible" },
+  
       cancel_at_period_end: false,
       metadata: { barId, planId, ciclo: cicloScelto },
     });
@@ -1538,7 +1538,7 @@ const preview = await stripe.invoices.createPreview({
       subscription_details: {
         items: [{ id: itemId, price: stripePriceId }],
         proration_behavior: "always_invoice", 
-        billing_mode: { type: "flexible" }, 
+       
       },
       automatic_tax: { enabled: true },
     });
