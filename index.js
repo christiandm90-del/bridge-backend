@@ -115,7 +115,28 @@ app.post(
             }
           }
           break;
-        }
+        }case "customer.tax_id.updated": {
+  const taxId = event.data.object;
+  if (taxId.verification?.status === "unverified") {
+    const barsSnap = await demasDb
+      .collectionGroup("meta")
+      .where("stripeCustomerId", "==", taxId.customer)
+      .limit(1)
+      .get();
+    if (!barsSnap.empty) {
+      const barId = barsSnap.docs[0].ref.parent.parent.id;
+      await demasDb.collection("bars").doc(barId).collection("meta").doc("info").update({
+        "billing.pivaVerificata": false,
+        "billing.daVerificare": true,
+      });
+      console.warn(`⚠️ P.IVA non verificata (VIES) per locale ${barId}`);
+    }
+  }
+  break;
+}
+
+
+
       case "customer.subscription.deleted": {
           const subscription = event.data.object;
           const customerId = subscription.customer;
@@ -375,6 +396,56 @@ async function verificaEcorreggiProdotti(localeId, prodottiClient) {
     },
   };
 }
+
+
+
+const geoip = require("geoip-lite");
+
+// Estrae l'IP reale del client anche dietro proxy (Render ecc.)
+function estraiIpReale(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (forwarded) return forwarded.split(",")[0].trim();
+  return req.socket.remoteAddress || null;
+}
+
+// Converte coordinate GPS in Paese (ISO2) via Google Geocoding.
+// Richiede GOOGLE_MAPS_API_KEY nelle env. Se manca la chiave o le coordinate, ritorna null senza errori.
+async function paeseDaCoordinate(lat, lng) {
+  if (lat == null || lng == null) return null;
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=3`;
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "DEMAS-App/1.0 (billing-verification)" },
+    });
+    const data = await resp.json();
+    return data.address?.country_code?.toUpperCase() || null; // es. "IT"
+  } catch (err) {
+    console.error("Errore reverse geocoding:", err.message);
+    return null;
+  }
+}
+
+// Confronta indirizzo dichiarato, IP e GPS. NON blocca mai l'attivazione:
+// produce solo un report-prova da salvare (richiesto da normativa UE) e
+// un flag per revisione manuale se le fonti sono in contraddizione.
+function verificaCoerenzaGeografica({ paeseDichiarato, ip, gpsPaese }) {
+  const record = ip ? geoip.lookup(ip) : null;
+  const paeseIp = record?.country || null;
+
+  const prove = [paeseDichiarato, paeseIp, gpsPaese].filter(Boolean);
+  const concordi = prove.filter((p) => p === paeseDichiarato).length;
+
+  return {
+    paeseDichiarato: paeseDichiarato || null,
+    paeseIp,
+    paeseGps: gpsPaese || null,
+    proveTotali: prove.length,
+    proveConcordanti: concordi,
+    anomaliaRilevata: prove.length >= 2 && concordi < prove.length,
+    verificatoIl: Date.now(),
+  };
+}
+
 /* =========================
    CREATE PAYMENT INTENT (Stripe)
    POST /create-payment-intent
@@ -1119,29 +1190,67 @@ app.post("/billing/create-payment-sheet", async (req, res) => {
       });
     }
 
+// P.IVA (se fornita): Stripe la verifica su VIES in modo asincrono
+if (indirizzo?.piva) {
+  try {
+    await stripe.customers.createTaxId(stripeCustomerId, {
+      type: "eu_vat",
+      value: indirizzo.piva,
+    });
+  } catch (err) {
+    console.error("⚠️ P.IVA non valida:", err.message);
+    // non blocchiamo qui: l'esito arriva async via webhook customer.tax_id.updated
+  }
+}
+
+// Prova incrociata di localizzazione: IP + GPS realtime (se il client l'ha inviato)
+const ipCliente = estraiIpReale(req);
+const gpsPaese = await paeseDaCoordinate(req.body.gps?.lat, req.body.gps?.lng);
+const coerenza = verificaCoerenzaGeografica({
+  paeseDichiarato: indirizzo?.country || null,
+  ip: ipCliente,
+  gpsPaese,
+});
+
+await infoRef.update({
+  "billing.provaLocalizzazione": coerenza,
+  "billing.daVerificare": coerenza.anomaliaRilevata,
+});
+
+if (coerenza.anomaliaRilevata) {
+  console.warn(`⚠️ Anomalia geografica locale ${barId}:`, coerenza);
+}
+
+
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: stripeCustomerId },
       { apiVersion: "2026-05-27.dahlia" } // stessa versione usata dal resto del backend
     );
 
-    const subscription = await stripe.subscriptions.create({
-      customer: stripeCustomerId,
-      items: [{ price: stripePriceId }],
-      payment_behavior: "default_incomplete",
-      payment_settings: { save_default_payment_method: "on_subscription" },
-      automatic_tax: { enabled: true },
-      expand: ["latest_invoice.payment_intent"],
-      metadata: { barId, planId, ciclo: cicloScelto },
-    });
+const subscription = await stripe.subscriptions.create({
+  customer: stripeCustomerId,
+  items: [{ price: stripePriceId }],
+  payment_behavior: "default_incomplete",
+  payment_settings: { save_default_payment_method: "on_subscription" },
+  automatic_tax: { enabled: true },
+  expand: ["latest_invoice.confirmation_secret", "pending_setup_intent"], // ← era latest_invoice.payment_intent
+  metadata: { barId, planId, ciclo: cicloScelto },
+});
 
-    const paymentIntent = subscription.latest_invoice.payment_intent;
+// Copre anche il caso trial/setup senza addebito immediato
+const clientSecret = subscription.pending_setup_intent
+  ? subscription.pending_setup_intent.client_secret
+  : subscription.latest_invoice.confirmation_secret.client_secret;
 
-    res.json({
-      paymentIntentClientSecret: paymentIntent.client_secret,
-      ephemeralKey: ephemeralKey.secret,
-      customerId: stripeCustomerId,
-      subscriptionId: subscription.id, // utile per rollback se l'utente annulla il pagamento
-    });
+res.json({
+  paymentIntentClientSecret: clientSecret,
+  ephemeralKey: ephemeralKey.secret,
+  customerId: stripeCustomerId,
+  subscriptionId: subscription.id,
+});
+  
+
+
 } catch (err) {
     console.error("❌ Errore create-payment-sheet:", err);
     if (isStripeTaxLocationError(err)) {
