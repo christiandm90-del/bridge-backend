@@ -1543,16 +1543,9 @@ const preview = await stripe.invoices.createPreview({
       automatic_tax: { enabled: true },
     });
 // DEBUG TEMPORANEO — rimuovi dopo aver diagnosticato
-console.log("DEBUG righe preview:", JSON.stringify(
-  preview.lines.data.map(l => ({
-    descrizione: l.description,
-    amount: l.amount,
-    tax_amounts: l.tax_amounts,
-    tax_rates: l.tax_rates,
-  })),
-  null,
-  2
-));
+console.log("DEBUG automatic_tax status:", JSON.stringify(preview.automatic_tax, null, 2));
+console.log("DEBUG subtotal/total:", preview.subtotal, preview.total);
+console.log("DEBUG riga completa:", JSON.stringify(preview.lines.data, null, 2));
 // Mostriamo TUTTE le righe, non solo quelle di proration del cambio
     // corrente — se ci sono voci pendenti residue da un problema precedente,
     // l'utente deve vederle, non scoprire un totale più alto di quanto mostrato.
