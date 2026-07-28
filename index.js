@@ -1452,8 +1452,7 @@ app.post("/billing/change-plan", async (req, res) => {
 const risultato = await stripe.subscriptions.update(info.stripeSubscriptionId, {
   items: [{ id: itemId, price: stripePriceId }],
   proration_behavior: "always_invoice",
-  payment_behavior: "pending_if_incomplete", // il piano cambia SOLO se il pagamento va a buon fine
-  cancel_at_period_end: false,
+  payment_behavior: "pending_if_incomplete",
   metadata: { barId, planId, ciclo: cicloScelto },
 });
 
