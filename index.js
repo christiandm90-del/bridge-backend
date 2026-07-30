@@ -87,6 +87,20 @@ case "customer.subscription.updated": {
     const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
     const infoSnap = await infoRef.get();
     const barData = infoSnap.data() || {};
+    if (subscription.status === "past_due") {
+      const overdueRef = demasDb.collection("overduePayments").doc(barId);
+      const overdueSnap = await overdueRef.get();
+      if (!overdueSnap.exists) {
+        await overdueRef.set({
+          scadutoDal: admin.firestore.FieldValue.serverTimestamp(),
+          stripeSubscriptionId: subscription.id,
+        });
+      }
+      await infoRef.update({ "piano.pagamentoScaduto": true });
+    } else if (subscription.status === "active") {
+      await demasDb.collection("overduePayments").doc(barId).delete().catch(() => {});
+      await infoRef.update({ "piano.pagamentoScaduto": admin.firestore.FieldValue.delete() });
+    }
 
     if (["incomplete_expired", "canceled"].includes(subscription.status)) {
       if (barData.stripeSubscriptionId === subscription.id) {
@@ -147,7 +161,8 @@ case "customer.subscription.updated": {
   const mappaSnap = await demasDb.collection("stripeCustomerMap").doc(customerId).get();
   if (mappaSnap.exists) {
     const barId = mappaSnap.data().barId;
-    await applyPlanToBar(barId, "free", "stripe-webhook-cancellation");
+        await demasDb.collection("overduePayments").doc(barId).delete().catch(() => {});
+    await applyPlanToBar(barId, "freeplan", "stripe-webhook-cancellation");
   }
   break;
 }
@@ -1622,7 +1637,80 @@ app.post("/billing/cancel-subscription", async (req, res) => {
     res.status(500).json({ error: "Errore cancellazione abbonamento" });
   }
 });
+/* =========================
+   BILLING — CONTROLLO PAGAMENTI SCADUTI (chiamato da cron esterno, 1 volta/giorno)
+   POST /billing/check-overdue-payments
+   Header richiesto: x-cron-secret
+========================= */
+app.post("/billing/check-overdue-payments", async (req, res) => {
+  try {
+    if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+      return res.status(403).json({ error: "unauthorized" });
+    }
 
+    const GRACE_GIORNI = 3;
+    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - GRACE_GIORNI * 24 * 60 * 60 * 1000);
+
+    const overdueSnap = await demasDb
+      .collection("overduePayments")
+      .where("scadutoDal", "<=", cutoff)
+      .get();
+
+    const risultati = [];
+    for (const doc of overdueSnap.docs) {
+      const barId = doc.id;
+      const { stripeSubscriptionId } = doc.data();
+      try {
+        if (stripeSubscriptionId) {
+          await stripe.subscriptions.cancel(stripeSubscriptionId).catch((err) => {
+            console.warn(`Subscription ${stripeSubscriptionId} già cancellata o non trovata:`, err.message);
+          });
+        }
+        await applyPlanToBar(barId, "freeplan", "grace-period-scaduto");
+        await doc.ref.delete();
+        risultati.push({ barId, azione: "downgrade a free" });
+      } catch (err) {
+        console.error(`❌ Errore downgrade locale ${barId}:`, err.message);
+      }
+    }
+
+    res.json({ elaborati: risultati.length, dettagli: risultati });
+  } catch (err) {
+    console.error("❌ Errore check-overdue-payments:", err);
+    res.status(500).json({ error: "Errore controllo pagamenti scaduti" });
+  }
+});
+
+/* =========================
+   BILLING — PORTALE CLIENTE STRIPE (aggiorna metodo di pagamento)
+   POST /billing/create-portal-session
+========================= */
+app.post("/billing/create-portal-session", async (req, res) => {
+  try {
+    const { token, barId, returnUrl } = req.body;
+    if (!token) return res.status(401).json({ error: "Utente non autenticato" });
+    const decoded = await demasApp.auth().verifyIdToken(token);
+    if (!barId) return res.status(400).json({ error: "barId mancante" });
+
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const infoSnap = await infoRef.get();
+    if (!infoSnap.exists) return res.status(404).json({ error: "Locale non trovato" });
+
+    const info = infoSnap.data();
+    if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
+    if (!info.stripeCustomerId) return res.status(400).json({ error: "Cliente Stripe non ancora creato" });
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: info.stripeCustomerId,
+      return_url: returnUrl || "https://bridge-backend-rnwa.onrender.com",
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("❌ Errore create-portal-session:", err);
+    res.status(500).json({ error: "Errore apertura portale pagamenti" });
+  }
+});
 /* =========================
    BILLING — ANNULLA LA DISDETTA (resta sul piano attuale)
    POST /billing/resume-subscription
