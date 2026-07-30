@@ -154,15 +154,15 @@ case "customer.subscription.updated": {
 
 
 
- case "customer.subscription.deleted": {
+case "customer.subscription.deleted": {
   const subscription = event.data.object;
   const customerId = subscription.customer;
 
   const mappaSnap = await demasDb.collection("stripeCustomerMap").doc(customerId).get();
   if (mappaSnap.exists) {
     const barId = mappaSnap.data().barId;
-        await demasDb.collection("overduePayments").doc(barId).delete().catch(() => {});
-    await applyPlanToBar(barId, "freeplan", "stripe-webhook-cancellation");
+    await demasDb.collection("overduePayments").doc(barId).delete().catch(() => {});
+    await applyPlanToBar(barId, "freeplan", "stripe-webhook-cancellation", "mensile", true);
   }
   break;
 }
@@ -1103,7 +1103,7 @@ app.get("/resolve-table/:token", async (req, res) => {
 /* =========================
    BILLING — HELPER
 ========================= */
-async function applyPlanToBar(barId, planId, source, ciclo = "mensile") {
+async function applyPlanToBar(barId, planId, source, ciclo = "mensile", resetCancellazione = false) {
   const planSnap = await demasDb.collection("plans").doc(planId).get();
   if (!planSnap.exists) throw new Error(`Piano "${planId}" non trovato in /plans`);
   const plan = planSnap.data();
@@ -1111,7 +1111,7 @@ async function applyPlanToBar(barId, planId, source, ciclo = "mensile") {
   const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
   const infoSnap = await infoRef.get();
   if (!infoSnap.exists) throw new Error(`Locale "${barId}" non trovato`);
- const info = infoSnap.data();
+  const info = infoSnap.data();
 
   const employees = Array.isArray(info.employees) ? info.employees : [];
   const permissions = {};
@@ -1119,19 +1119,28 @@ async function applyPlanToBar(barId, planId, source, ciclo = "mensile") {
     if (emp?.id) permissions[emp.id] = { ...plan.permissionsDefault };
   });
 
-await infoRef.update({
-    piano: {
-      tipo: planId,
-      ciclo,
-      personalizzato: false,
-      aggiornatoDa: source,
-      aggiornatoIl: admin.firestore.FieldValue.serverTimestamp(),
-    },
+  const aggiornamento = {
+    "piano.tipo": planId,
+    "piano.ciclo": ciclo,
+    "piano.personalizzato": false,
+    "piano.aggiornatoDa": source,
+    "piano.aggiornatoIl": admin.firestore.FieldValue.serverTimestamp(),
     zoneConfig: {
       limits: plan.limits,
       permissions,
     },
-  });
+  };
+
+  // Solo su cancellazione REALE (subscription eliminata) azzeriamo lo stato
+  // di disdetta — altrimenti, se il piano viene semplicemente riapplicato
+  // per un evento non correlato (es. toggle cancel_at_period_end), non deve
+  // toccare questi campi.
+  if (resetCancellazione) {
+    aggiornamento["piano.cancellazionePendente"] = false;
+    aggiornamento["piano.cancellaIl"] = null;
+  }
+
+  await infoRef.update(aggiornamento);
 
   console.log(`✅ Piano di ${barId} aggiornato a "${planId}" (${ciclo}, ${source})`);
 }
