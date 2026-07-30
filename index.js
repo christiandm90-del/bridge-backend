@@ -1468,6 +1468,7 @@ const risultato = await stripe.subscriptions.update(info.stripeSubscriptionId, {
   items: [{ id: itemId, price: stripePriceId }],
   proration_behavior: "always_invoice",
   payment_behavior: "pending_if_incomplete",
+    billing_cycle_anchor: "now",
   metadata: { barId, planId, ciclo: cicloScelto },
 });
 
@@ -1561,6 +1562,7 @@ const preview = await stripe.invoices.createPreview({
       subscription_details: {
         items: [{ id: itemId, price: stripePriceId }],
         proration_behavior: "always_invoice", 
+        billing_cycle_anchor: "now",
        
       },
       automatic_tax: { enabled: true },
