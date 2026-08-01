@@ -751,7 +751,54 @@ app.post("/devices/employee-login", async (req, res) => {
 
 
 
-
+/* ============================================================================
+   POST /employees/set-pin
+   Crea/aggiorna il PIN di un dipendente. SOLO owner/manager (tier>900) può
+   chiamarlo. Il PIN in chiaro arriva qui una volta sola per essere hashato
+   — non viene mai più restituito né salvato in chiaro da nessuna parte.
+   Body: { employeeId, pin }  — pin: 4-6 cifre numeriche
+   ============================================================================ */
+app.post("/employees/set-pin", async (req, res) => {
+  try {
+    const accesso = await resolveAccessoDispositivo(req);
+    const { barId } = accesso;
+    richiedeManagerOAccessoOwner(req, accesso);
+ 
+    const { employeeId, pin } = req.body;
+    if (!employeeId || !pin) return res.status(400).json({ error: "Dati mancanti" });
+    if (!/^\d{4,6}$/.test(String(pin))) {
+      return res.status(400).json({ error: "Il PIN deve avere tra 4 e 6 cifre numeriche" });
+    }
+ 
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const pinHash = await bcrypt.hash(String(pin), 10);
+ 
+    await demasDb.runTransaction(async (tx) => {
+      const snap = await tx.get(infoRef);
+      if (!snap.exists) throw Object.assign(new Error("Locale non trovato"), { status: 404 });
+ 
+      const employees = snap.data().employees || [];
+      const found = employees.find((e) => e.id === employeeId);
+      if (!found) throw Object.assign(new Error("Dipendente non trovato"), { status: 404 });
+ 
+      // FieldValue.delete() non funziona dentro un array (limite Firestore):
+      // per rimuovere il vecchio campo "password" in chiaro dobbiamo
+      // ricostruire l'oggetto senza quella chiave, non usare delete().
+      const cleaned = employees.map((e) => {
+        if (e.id !== employeeId) return e;
+        const { password, ...rest } = e;
+        return { ...rest, pinHash, loginAttempts: 0, blocked: false };
+      });
+ 
+      tx.set(infoRef, { employees: cleaned }, { merge: true });
+    });
+ 
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ employees/set-pin:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
 
 
 
