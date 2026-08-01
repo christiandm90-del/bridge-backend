@@ -2,7 +2,8 @@ const express = require("express");
 const admin = require("firebase-admin");
 const cors = require("cors");
 const Stripe = require("stripe");
-
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
 const app = express();
 app.use(cors());
 /* =========================
@@ -246,9 +247,526 @@ app.get("/", (req, res) => {
   res.send("✅ Bridge backend online");
 });
 
+
+
+
+
+
+async function resolveAccessoDispositivo(req) {
+  const authHeader = req.headers.authorization || "";
+  const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!idToken) {
+    const err = new Error("Token mancante");
+    err.status = 401;
+    throw err;
+  }
+ 
+  let decoded;
+  try {
+    decoded = await demasApp.auth().verifyIdToken(idToken, true);
+  } catch (e) {
+    const err = new Error(
+      e.code === "auth/id-token-revoked" ? "Sessione revocata" : "Token non valido"
+    );
+    err.status = 401;
+    throw err;
+  }
+ 
+  // Caso 1: dispositivo pairato (claims custom impostati alla creazione)
+  if (decoded.barId && decoded.deviceId) {
+    const deviceSnap = await demasDb
+      .collection("bars").doc(decoded.barId)
+      .collection("devices").doc(decoded.deviceId)
+      .get();
+ 
+    if (!deviceSnap.exists || deviceSnap.data().status !== "active") {
+      const err = new Error("Dispositivo non autorizzato");
+      err.status = 403;
+      throw err;
+    }
+ 
+    return { barId: decoded.barId, deviceId: decoded.deviceId, isOwnerSession: false };
+  }
+ 
+  // Caso 2: sessione proprietario classica — bars/{uid} deve esistere e
+  // appartenergli (stesso controllo già usato altrove nel backend).
+  const infoSnap = await demasDb.collection("bars").doc(decoded.uid).collection("meta").doc("info").get();
+  if (infoSnap.exists && infoSnap.data().uid === decoded.uid) {
+    return { barId: decoded.uid, deviceId: `owner:${decoded.uid}`, isOwnerSession: true };
+  }
+ 
+  const err = new Error("Accesso non riconosciuto");
+  err.status = 403;
+  throw err;
+}
+ 
+/* ============================================================================
+   HELPERS AUTH — DIPENDENTE (JWT proprio, non Firebase Auth)
+   ============================================================================ */
+ 
+function emettiEmployeeToken({ barId, deviceId, employeeId, tier }) {
+  return jwt.sign(
+    { barId, deviceId, employeeId, tier },
+    process.env.EMPLOYEE_JWT_SECRET,
+    { expiresIn: "14h" }
+  );
+}
+ 
+function verificaEmployeeToken(req, { barId, deviceId }) {
+  const raw = req.headers["x-employee-token"];
+  if (!raw) {
+    const err = new Error("Sessione dipendente mancante");
+    err.status = 401;
+    throw err;
+  }
+  let payload;
+  try {
+    payload = jwt.verify(raw, process.env.EMPLOYEE_JWT_SECRET);
+  } catch (e) {
+    const err = new Error("Sessione dipendente scaduta o non valida");
+    err.status = 401;
+    throw err;
+  }
+  // La sessione dipendente deve appartenere allo STESSO device+bar del
+  // token Firebase presentato nella stessa richiesta — impedisce di
+  // riusare un employee-token rubato su un device diverso.
+  if (payload.barId !== barId || payload.deviceId !== deviceId) {
+    const err = new Error("Sessione dipendente non corrispondente al dispositivo");
+    err.status = 403;
+    throw err;
+  }
+  return payload;
+}
+ 
+function richiedeManager(employeePayload) {
+  if (!(employeePayload.tier > 900)) {
+    const err = new Error("Permessi insufficienti (richiede owner o manager)");
+    err.status = 403;
+    throw err;
+  }
+}
+ 
+// Il proprietario in sessione email+password è SEMPRE autorizzato (tier
+// virtuale 999, come da documento). Un dispositivo pairato deve invece
+// presentare un employee-token valido con tier>900 (owner o manager).
+function richiedeManagerOAccessoOwner(req, accesso) {
+  if (accesso.isOwnerSession) {
+    return { employeeId: "owner", tier: 999 };
+  }
+  const emp = verificaEmployeeToken(req, accesso);
+  richiedeManager(emp);
+  return emp;
+}
+ 
+// Codice numerico leggibile, mostrato su entrambi gli schermi per
+// conferma umana in più rispetto al solo pairingToken.
+function generaCodiceVerifica() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+ 
+/* ============================================================================
+   POST /devices/pairing/start
+   Chiamato dal dispositivo GIÀ autorizzato (owner o manager tier>900) per
+   generare un nuovo QR di pairing.
+   ============================================================================ */
+app.post("/devices/pairing/start", async (req, res) => {
+  try {
+    const accesso = await resolveAccessoDispositivo(req);
+    const { barId, deviceId } = accesso;
+    const emp = richiedeManagerOAccessoOwner(req, accesso);
+ 
+    const pairingId = crypto.randomUUID();
+    const scadeAt = Date.now() + 3 * 60 * 1000; // 3 minuti
+ 
+    const pairingToken = jwt.sign(
+      { pairingId, barId },
+      process.env.PAIRING_JWT_SECRET,
+      { expiresIn: "3m" }
+    );
+ 
+    await demasDb.collection("pairingSessions").doc(pairingId).set({
+      barId,
+      status: "waiting_scan",
+      startedBy: emp.employeeId,
+      startedByDeviceId: deviceId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      scadeAt,
+      code: null,
+      deviceName: null,
+      platform: null,
+      approvedBy: null,
+      newDeviceId: null,
+      customToken: null,
+      consumed: false,
+    });
+ 
+    res.json({ pairingId, pairingToken, scadeAt });
+  } catch (err) {
+    console.error("❌ pairing/start:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+ 
+/* ============================================================================
+   POST /devices/pairing/scan
+   Chiamato dal dispositivo NUOVO (non ancora autorizzato) dopo aver
+   scansionato il QR. Nessuna autenticazione — il pairingToken firmato è
+   l'unica prova richiesta, e scade in 3 minuti.
+   ============================================================================ */
+app.post("/devices/pairing/scan", async (req, res) => {
+  try {
+    const { pairingToken, deviceName, platform } = req.body;
+    if (!pairingToken) return res.status(400).json({ error: "pairingToken mancante" });
+ 
+    let payload;
+    try {
+      payload = jwt.verify(pairingToken, process.env.PAIRING_JWT_SECRET);
+    } catch {
+      return res.status(410).json({ error: "QR scaduto o non valido" });
+    }
+ 
+    const ref = demasDb.collection("pairingSessions").doc(payload.pairingId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "Sessione di pairing non trovata" });
+ 
+    const sessione = snap.data();
+    if (sessione.status !== "waiting_scan") {
+      return res.status(409).json({ error: "QR già scansionato o non più valido" });
+    }
+    if (sessione.scadeAt < Date.now()) {
+      return res.status(410).json({ error: "QR scaduto" });
+    }
+ 
+    const codice = generaCodiceVerifica();
+    await ref.update({
+      status: "waiting_approval",
+      code: codice,
+      deviceName: (deviceName || "Nuovo dispositivo").slice(0, 60),
+      platform: (platform || "web").slice(0, 30),
+      scannedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+ 
+    res.json({ pairingId: payload.pairingId, code: codice });
+  } catch (err) {
+    console.error("❌ pairing/scan:", err.message);
+    res.status(500).json({ error: "Errore durante la scansione" });
+  }
+});
+ 
+/* ============================================================================
+   GET /devices/pairing/owner-status/:pairingId
+   Polling dal dispositivo OWNER/MANAGER che ha generato il QR, per vedere
+   quando arriva la scansione e mostrare il codice da confermare.
+   ============================================================================ */
+app.get("/devices/pairing/owner-status/:pairingId", async (req, res) => {
+  try {
+    const accesso = await resolveAccessoDispositivo(req);
+    const { barId, deviceId } = accesso;
+    const emp = richiedeManagerOAccessoOwner(req, accesso);
+ 
+    const snap = await demasDb.collection("pairingSessions").doc(req.params.pairingId).get();
+    if (!snap.exists) return res.status(404).json({ error: "Sessione non trovata" });
+ 
+    const sessione = snap.data();
+    if (sessione.barId !== barId) return res.status(403).json({ error: "Non autorizzato" });
+ 
+    res.json({
+      status: sessione.status,
+      code: sessione.code,
+      deviceName: sessione.deviceName,
+      platform: sessione.platform,
+      scadeAt: sessione.scadeAt,
+    });
+  } catch (err) {
+    console.error("❌ pairing/owner-status:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+ 
+/* ============================================================================
+   POST /devices/pairing/approve
+   Il manager/owner conferma il codice mostrato → crea l'identità Firebase
+   dedicata al nuovo dispositivo e la registra come "active".
+   ============================================================================ */
+app.post("/devices/pairing/approve", async (req, res) => {
+  try {
+    const accesso = await resolveAccessoDispositivo(req);
+    const { barId, deviceId } = accesso;
+    const emp = richiedeManagerOAccessoOwner(req, accesso);
+ 
+    const { pairingId, codeConferma, deviceLabel } = req.body;
+    if (!pairingId || !codeConferma) {
+      return res.status(400).json({ error: "pairingId o codice mancante" });
+    }
+ 
+    const ref = demasDb.collection("pairingSessions").doc(pairingId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "Sessione non trovata" });
+ 
+    const sessione = snap.data();
+    if (sessione.barId !== barId) return res.status(403).json({ error: "Non autorizzato" });
+    if (sessione.status !== "waiting_approval") {
+      return res.status(409).json({ error: "Sessione non in attesa di approvazione" });
+    }
+    if (sessione.scadeAt < Date.now()) {
+      await ref.update({ status: "expired" });
+      return res.status(410).json({ error: "Sessione scaduta" });
+    }
+    if (String(codeConferma).trim() !== sessione.code) {
+      return res.status(400).json({ error: "Codice di conferma errato" });
+    }
+ 
+    const newDeviceId = crypto.randomUUID();
+ 
+    // Nessun createUser esplicito necessario: createCustomToken funziona
+    // anche su un uid che non esiste ancora, Firebase lo crea al primo login.
+    const customToken = await demasApp.auth().createCustomToken(newDeviceId, {
+      barId,
+      deviceId: newDeviceId,
+    });
+ 
+    await demasDb.collection("bars").doc(barId).collection("devices").doc(newDeviceId).set({
+      name: (deviceLabel || sessione.deviceName || "Dispositivo").slice(0, 60),
+      platform: sessione.platform || "web",
+      status: "active",
+      pairedAt: admin.firestore.FieldValue.serverTimestamp(),
+      pairedBy: emp.employeeId,
+      lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+ 
+    await ref.update({
+      status: "approved",
+      approvedBy: emp.employeeId,
+      newDeviceId,
+      customToken,
+      consumed: false,
+    });
+ 
+    res.json({ success: true, deviceId: newDeviceId });
+  } catch (err) {
+    console.error("❌ pairing/approve:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+ 
+/* ============================================================================
+   POST /devices/pairing/deny
+   Il manager rifiuta il codice/dispositivo (es. codice non coincide di
+   persona, o dispositivo sconosciuto).
+   ============================================================================ */
+app.post("/devices/pairing/deny", async (req, res) => {
+  try {
+    const accesso = await resolveAccessoDispositivo(req);
+    const { barId, deviceId } = accesso;
+    const emp = richiedeManagerOAccessoOwner(req, accesso);
+ 
+    const { pairingId } = req.body;
+    const ref = demasDb.collection("pairingSessions").doc(pairingId);
+    const snap = await ref.get();
+    if (!snap.exists || snap.data().barId !== barId) {
+      return res.status(404).json({ error: "Sessione non trovata" });
+    }
+ 
+    await ref.update({ status: "denied" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ pairing/deny:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+ 
+/* ============================================================================
+   POST /devices/pairing/redeem
+   Chiamato in polling dal dispositivo NUOVO con il pairingToken ottenuto
+   dal QR. Consegna il customToken UNA SOLA VOLTA (consumed flag) quando lo
+   stato diventa "approved".
+   ============================================================================ */
+app.post("/devices/pairing/redeem", async (req, res) => {
+  try {
+    const { pairingToken } = req.body;
+    if (!pairingToken) return res.status(400).json({ error: "pairingToken mancante" });
+ 
+    let payload;
+    try {
+      payload = jwt.verify(pairingToken, process.env.PAIRING_JWT_SECRET);
+    } catch {
+      return res.status(410).json({ error: "QR scaduto" });
+    }
+ 
+    const ref = demasDb.collection("pairingSessions").doc(payload.pairingId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "Sessione non trovata" });
+ 
+    const sessione = snap.data();
+ 
+    if (sessione.status === "denied") return res.json({ status: "denied" });
+    if (sessione.status === "expired" || sessione.scadeAt < Date.now()) {
+      return res.json({ status: "expired" });
+    }
+    if (sessione.status !== "approved") {
+      return res.json({ status: sessione.status }); // waiting_scan / waiting_approval
+    }
+    if (sessione.consumed) {
+      // Già ritirato in precedenza: non riconsegnare mai due volte un customToken
+      return res.status(409).json({ error: "Token già utilizzato" });
+    }
+ 
+    // Consuma atomicamente per evitare doppia consegna in caso di poll concorrenti
+    await ref.update({ consumed: true });
+ 
+    res.json({
+      status: "approved",
+      customToken: sessione.customToken,
+      deviceId: sessione.newDeviceId,
+      barId: sessione.barId,
+    });
+  } catch (err) {
+    console.error("❌ pairing/redeem:", err.message);
+    res.status(500).json({ error: "Errore durante il recupero del token" });
+  }
+});
+ 
+/* ============================================================================
+   GET /devices/list
+   Lista dispositivi autorizzati per il locale — solo owner/manager.
+   ============================================================================ */
+app.get("/devices/list", async (req, res) => {
+  try {
+    const accesso = await resolveAccessoDispositivo(req);
+    const { barId, deviceId } = accesso;
+    const emp = richiedeManagerOAccessoOwner(req, accesso);
+ 
+    const snap = await demasDb.collection("bars").doc(barId).collection("devices").get();
+    const devices = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    res.json({ devices });
+  } catch (err) {
+    console.error("❌ devices/list:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+ 
+/* ============================================================================
+   POST /devices/revoke
+   Revoca immediata: disabilita l'utente Firebase del device (blocca anche i
+   token già emessi grazie a checkRevoked) + flag Firestore.
+   ============================================================================ */
+app.post("/devices/revoke", async (req, res) => {
+  try {
+    const accesso = await resolveAccessoDispositivo(req);
+    const { barId, deviceId } = accesso;
+    const emp = richiedeManagerOAccessoOwner(req, accesso);
+ 
+    const { targetDeviceId } = req.body;
+    if (!targetDeviceId) return res.status(400).json({ error: "targetDeviceId mancante" });
+ 
+    const targetRef = demasDb.collection("bars").doc(barId).collection("devices").doc(targetDeviceId);
+    const targetSnap = await targetRef.get();
+    if (!targetSnap.exists) return res.status(404).json({ error: "Dispositivo non trovato" });
+ 
+    await targetRef.update({
+      status: "revoked",
+      revokedAt: admin.firestore.FieldValue.serverTimestamp(),
+      revokedBy: emp.employeeId,
+    });
+ 
+    // Invalida qualsiasi ID token del device già emesso, anche se non ancora scaduto
+    await demasApp.auth().revokeRefreshTokens(targetDeviceId).catch(() => {});
+    await demasApp.auth().updateUser(targetDeviceId, { disabled: true }).catch(() => {});
+ 
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ devices/revoke:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+ 
+/* ============================================================================
+   POST /devices/employee-login
+   Login del dipendente SUL device già associato — PIN hashato (bcrypt),
+   verificato interamente lato server dentro una transazione Firestore per
+   restare atomica sui tentativi falliti/blocco, come nel codice originale.
+   ============================================================================ */
+app.post("/devices/employee-login", async (req, res) => {
+  try {
+    const { barId, deviceId } = await resolveAccessoDispositivo(req);
+    const { employeeId, pin } = req.body;
+    if (!employeeId || !pin) return res.status(400).json({ error: "Dati mancanti" });
+ 
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+ 
+    const risultato = await demasDb.runTransaction(async (tx) => {
+      const snap = await tx.get(infoRef);
+      if (!snap.exists) throw Object.assign(new Error("Locale non trovato"), { status: 404 });
+ 
+      const employees = snap.data().employees || [];
+      const found = employees.find((e) => e.id === employeeId);
+      if (!found) throw Object.assign(new Error("Dipendente non valido"), { status: 404 });
+      if (found.blocked) {
+        throw Object.assign(
+          new Error(found.tier === 999 ? "Account bloccato. Contatta l'assistenza." : "Utente bloccato. Contatta il titolare."),
+          { status: 403 }
+        );
+      }
+ 
+      const pinOk = found.pinHash ? await bcrypt.compare(String(pin), found.pinHash) : false;
+ 
+      if (!pinOk) {
+        const nuoviTentativi = (found.loginAttempts || 0) + 1;
+        const bloccato = nuoviTentativi >= 5;
+        const updated = employees.map((e) =>
+          e.id === employeeId ? { ...e, loginAttempts: nuoviTentativi, blocked: bloccato } : e
+        );
+        tx.set(infoRef, { employees: updated }, { merge: true });
+        throw Object.assign(
+          new Error(bloccato ? "Troppi tentativi. Utente bloccato." : `PIN errato (${nuoviTentativi}/5)`),
+          { status: 401 }
+        );
+      }
+ 
+      const updated = employees.map((e) =>
+        e.id === employeeId ? { ...e, loginAttempts: 0, blocked: false } : e
+      );
+      tx.set(infoRef, { employees: updated }, { merge: true });
+ 
+      return { id: found.id, name: found.name, role: found.role, tier: found.tier, permissions: found.permissions };
+    });
+ 
+    await demasDb.collection("bars").doc(barId).collection("devices").doc(deviceId)
+      .update({ lastSeenAt: admin.firestore.FieldValue.serverTimestamp() })
+      .catch(() => {});
+ 
+    const employeeToken = emettiEmployeeToken({
+      barId,
+      deviceId,
+      employeeId: risultato.id,
+      tier: risultato.tier,
+    });
+ 
+    res.json({ success: true, employee: risultato, employeeToken });
+  } catch (err) {
+    console.error("❌ employee-login:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /* =========================
    SYNC MENU (DEMAS → APPBASE)
 ========================= */
+
 
 
 {/**app.post("/sync-menu", async (req, res) => {
