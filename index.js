@@ -304,12 +304,21 @@ async function resolveAccessoDispositivo(req) {
    HELPERS AUTH — DIPENDENTE (JWT proprio, non Firebase Auth)
    ============================================================================ */
  
-function emettiEmployeeToken({ barId, deviceId, employeeId, tier }) {
-  return jwt.sign(
-    { barId, deviceId, employeeId, tier },
-    process.env.EMPLOYEE_JWT_SECRET,
-    { expiresIn: "14h" }
-  );
+// sessionDurationHours: null/undefined = nessuna scadenza (token senza exp).
+// Restituisce anche expiresAt in ms, così il client sa esattamente quando
+// avvisare l'utente e forzare il logout, senza dover decodificare il JWT.
+function emettiEmployeeToken({ barId, deviceId, employeeId, tier, sessionDurationHours }) {
+  const payload = { barId, deviceId, employeeId, tier };
+  const options = {};
+  let expiresAt = null;
+ 
+  if (sessionDurationHours != null && sessionDurationHours > 0) {
+    options.expiresIn = `${sessionDurationHours}h`;
+    expiresAt = Date.now() + sessionDurationHours * 60 * 60 * 1000;
+  }
+ 
+  const token = jwt.sign(payload, process.env.EMPLOYEE_JWT_SECRET, options);
+  return { token, expiresAt };
 }
  
 function verificaEmployeeToken(req, { barId, deviceId }) {
@@ -363,6 +372,28 @@ function richiedeManagerOAccessoOwner(req, accesso) {
 function generaCodiceVerifica() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
+// Pulizia opportunistica: le sessioni di pairing abbandonate (mai
+// scansionate, o scansionate ma mai approvate/negate) restavano per
+// sempre su Firestore. Non serve un cron esterno: ne cancelliamo un
+// piccolo lotto ogni volta che si genera un nuovo QR — "best effort",
+// non blocca mai la risposta principale se fallisce.
+async function pulisciSessioniPairingScadute(barId) {
+  try {
+    const snap = await demasDb
+      .collection("pairingSessions")
+      .where("barId", "==", barId)
+      .where("scadeAt", "<", Date.now() - 5 * 60 * 1000) // margine di 5 minuti
+      .limit(10)
+      .get();
+ 
+    if (snap.empty) return;
+    const batch = demasDb.batch();
+    snap.docs.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
+  } catch (err) {
+    console.error("⚠️ Pulizia sessioni pairing fallita (non bloccante):", err.message);
+  }
+}
  
 /* ============================================================================
    POST /devices/pairing/start
@@ -374,6 +405,18 @@ app.post("/devices/pairing/start", async (req, res) => {
     const accesso = await resolveAccessoDispositivo(req);
     const { barId, deviceId } = accesso;
     const emp = richiedeManagerOAccessoOwner(req, accesso);
+ 
+    // Durata della sessione dipendente per i login PIN su QUESTO dispositivo,
+    // scelta dall'owner/manager al momento del pairing. null = senza scadenza.
+    const { sessionDurationHours } = req.body;
+    const durataValida =
+      sessionDurationHours === null || sessionDurationHours === undefined
+        ? null
+        : Math.max(1, Math.min(168, Number(sessionDurationHours) || 12)); // clamp 1-168h (una settimana)
+ 
+    // Non blocca la risposta: se fallisce, va bene lo stesso, ritenteremo
+    // al prossimo pairing.
+    pulisciSessioniPairingScadute(barId);
  
     const pairingId = crypto.randomUUID();
     const scadeAt = Date.now() + 3 * 60 * 1000; // 3 minuti
@@ -391,6 +434,7 @@ app.post("/devices/pairing/start", async (req, res) => {
       startedByDeviceId: deviceId,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       scadeAt,
+      sessionDurationHours: durataValida,
       code: null,
       deviceName: null,
       platform: null,
@@ -406,6 +450,7 @@ app.post("/devices/pairing/start", async (req, res) => {
     res.status(err.status || 500).json({ error: err.message });
   }
 });
+ 
  
 /* ============================================================================
    POST /devices/pairing/scan
@@ -452,7 +497,6 @@ app.post("/devices/pairing/scan", async (req, res) => {
     res.status(500).json({ error: "Errore durante la scansione" });
   }
 });
- 
 /* ============================================================================
    GET /devices/pairing/owner-status/:pairingId
    Polling dal dispositivo OWNER/MANAGER che ha generato il QR, per vedere
@@ -482,7 +526,6 @@ app.get("/devices/pairing/owner-status/:pairingId", async (req, res) => {
     res.status(err.status || 500).json({ error: err.message });
   }
 });
- 
 /* ============================================================================
    POST /devices/pairing/approve
    Il manager/owner conferma il codice mostrato → crea l'identità Firebase
@@ -529,6 +572,9 @@ app.post("/devices/pairing/approve", async (req, res) => {
       name: (deviceLabel || sessione.deviceName || "Dispositivo").slice(0, 60),
       platform: sessione.platform || "web",
       status: "active",
+      // Policy di durata sessione dipendente per i login PIN su questo
+      // device, decisa al momento del pairing — null = senza scadenza.
+      sessionDurationHours: sessione.sessionDurationHours ?? null,
       pairedAt: admin.firestore.FieldValue.serverTimestamp(),
       pairedBy: emp.employeeId,
       lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -574,7 +620,6 @@ app.post("/devices/pairing/deny", async (req, res) => {
     res.status(err.status || 500).json({ error: err.message });
   }
 });
- 
 /* ============================================================================
    POST /devices/pairing/redeem
    Chiamato in polling dal dispositivo NUOVO con il pairingToken ottenuto
@@ -625,7 +670,6 @@ app.post("/devices/pairing/redeem", async (req, res) => {
     res.status(500).json({ error: "Errore durante il recupero del token" });
   }
 });
- 
 /* ============================================================================
    GET /devices/list
    Lista dispositivi autorizzati per il locale — solo owner/manager.
@@ -688,9 +732,20 @@ app.post("/devices/revoke", async (req, res) => {
    ============================================================================ */
 app.post("/devices/employee-login", async (req, res) => {
   try {
-    const { barId, deviceId } = await resolveAccessoDispositivo(req);
+    const accesso = await resolveAccessoDispositivo(req);
+    const { barId, deviceId } = accesso;
     const { employeeId, pin } = req.body;
     if (!employeeId || !pin) return res.status(400).json({ error: "Dati mancanti" });
+ 
+    // Durata sessione configurata sul device in fase di pairing (null =
+    // senza scadenza). Le sessioni owner (email+password) non hanno un
+    // documento "device" — restano senza scadenza, coerente col fatto che
+    // usano comunque la loro sessione Firebase personale, non condivisa.
+    let sessionDurationHours = null;
+    if (!accesso.isOwnerSession) {
+      const deviceSnap = await demasDb.collection("bars").doc(barId).collection("devices").doc(deviceId).get();
+      sessionDurationHours = deviceSnap.exists ? deviceSnap.data().sessionDurationHours ?? null : null;
+    }
  
     const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
  
@@ -735,14 +790,20 @@ app.post("/devices/employee-login", async (req, res) => {
       .update({ lastSeenAt: admin.firestore.FieldValue.serverTimestamp() })
       .catch(() => {});
  
-    const employeeToken = emettiEmployeeToken({
+    const employeeTokenResult = emettiEmployeeToken({
       barId,
       deviceId,
       employeeId: risultato.id,
       tier: risultato.tier,
+      sessionDurationHours,
     });
  
-    res.json({ success: true, employee: risultato, employeeToken });
+    res.json({
+      success: true,
+      employee: risultato,
+      employeeToken: employeeTokenResult.token,
+      sessionExpiresAt: employeeTokenResult.expiresAt, // null = senza scadenza
+    });
   } catch (err) {
     console.error("❌ employee-login:", err.message);
     res.status(err.status || 500).json({ error: err.message });
