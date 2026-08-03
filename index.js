@@ -233,7 +233,10 @@ const appbaseApp = admin.initializeApp(
 );
 
 const demasApp = admin.initializeApp(
-  { credential: admin.credential.cert(demasServiceAccount) },
+  {
+    credential: admin.credential.cert(demasServiceAccount),
+    databaseURL: process.env.DEMAS_DATABASE_URL,   // <-- riga aggiunta
+  },
   "demas"
 );
 
@@ -250,8 +253,65 @@ app.get("/", (req, res) => {
 
 
 
+/* ============================================================================
+   ISTRUZIONI DI INTEGRAZIONE
+   ============================================================================
+   1. npm install jsonwebtoken bcryptjs
+      (crypto.randomUUID() è nativo in Node 20+, niente pacchetto uuid)
 
+   2. Aggiungi queste due variabili d'ambiente su Render (secret lunghi random,
+      es. generati con: node -e "console.log(require('crypto').randomBytes(48).toString('hex'))")
+        EMPLOYEE_JWT_SECRET=...
+        PAIRING_JWT_SECRET=...
 
+   3. In cima al file, dopo gli altri require:
+        const jwt = require("jsonwebtoken");
+        const bcrypt = require("bcryptjs");
+
+   4. Incolla il contenuto di questo file DOPO l'inizializzazione di
+      `demasDb` / `demasApp` (servono già pronti) e PRIMA di `app.listen(...)`.
+
+   5. IMPORTANTE — migrazione dipendenti esistenti:
+      Oggi gli employee hanno `password` in chiaro. Questi nuovi endpoint
+      leggono/scrivono `pinHash` (bcrypt). Serve un endpoint separato per
+      creare/cambiare il PIN di un dipendente (lato SettingsPanel.tsx) che
+      hasha lato server — dimmi quando vuoi che lo scriva, non l'ho incluso
+      qui perché non ho ancora visto quel file.
+
+   6. NOVITÀ — kick immediato dispositivo revocato: serve accesso RTDB
+      dall'Admin SDK, che il tuo index.js oggi non ha (solo Firestore).
+      Nel TUO index.js, dove inizializzi demasApp, aggiungi SOLO
+      `databaseURL` (la trovi in Firebase Console → Impostazioni progetto →
+      Realtime Database, di solito
+      https://<project-id>-default-rtdb.<region>.firebasedatabase.app):
+
+        const demasApp = admin.initializeApp(
+          {
+            credential: admin.credential.cert(demasServiceAccount),
+            databaseURL: process.env.DEMAS_DATABASE_URL,   // <-- riga da aggiungere
+          },
+          "demas"
+        );
+
+      E aggiungi la variabile d'ambiente DEMAS_DATABASE_URL su Render con
+      quel valore. Nessun'altra riga del tuo index.js va toccata.
+   ============================================================================ */
+
+// RTDB (non solo Firestore) — serve per il kick in tempo reale dei
+// dispositivi revocati, vedi punto 6 sopra.
+const demasRtdb = demasApp.database();
+
+/* ============================================================================
+   HELPERS AUTH — DEVICE (Firebase custom auth per-dispositivo) O OWNER
+   (Firebase email+password classico, resta sempre disponibile per il
+   proprietario come da documento — non passa dal pairing).
+   ============================================================================ */
+
+// Verifica il token Firebase di CHI sta chiamando l'endpoint, che sia un
+// dispositivo pairato (claims barId+deviceId) oppure il proprietario loggato
+// con email+password (uid Firebase == id del documento bars/{uid}).
+// checkRevoked:true → se il device è stato disabilitato/revocato, questo
+// fallisce SUBITO anche se l'ID token locale non è ancora scaduto.
 async function resolveAccessoDispositivo(req) {
   const authHeader = req.headers.authorization || "";
   const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -260,7 +320,7 @@ async function resolveAccessoDispositivo(req) {
     err.status = 401;
     throw err;
   }
- 
+
   let decoded;
   try {
     decoded = await demasApp.auth().verifyIdToken(idToken, true);
@@ -271,39 +331,39 @@ async function resolveAccessoDispositivo(req) {
     err.status = 401;
     throw err;
   }
- 
+
   // Caso 1: dispositivo pairato (claims custom impostati alla creazione)
   if (decoded.barId && decoded.deviceId) {
     const deviceSnap = await demasDb
       .collection("bars").doc(decoded.barId)
       .collection("devices").doc(decoded.deviceId)
       .get();
- 
+
     if (!deviceSnap.exists || deviceSnap.data().status !== "active") {
       const err = new Error("Dispositivo non autorizzato");
       err.status = 403;
       throw err;
     }
- 
+
     return { barId: decoded.barId, deviceId: decoded.deviceId, isOwnerSession: false };
   }
- 
+
   // Caso 2: sessione proprietario classica — bars/{uid} deve esistere e
   // appartenergli (stesso controllo già usato altrove nel backend).
   const infoSnap = await demasDb.collection("bars").doc(decoded.uid).collection("meta").doc("info").get();
   if (infoSnap.exists && infoSnap.data().uid === decoded.uid) {
     return { barId: decoded.uid, deviceId: `owner:${decoded.uid}`, isOwnerSession: true };
   }
- 
+
   const err = new Error("Accesso non riconosciuto");
   err.status = 403;
   throw err;
 }
- 
+
 /* ============================================================================
    HELPERS AUTH — DIPENDENTE (JWT proprio, non Firebase Auth)
    ============================================================================ */
- 
+
 // sessionDurationHours: null/undefined = nessuna scadenza (token senza exp).
 // Restituisce anche expiresAt in ms, così il client sa esattamente quando
 // avvisare l'utente e forzare il logout, senza dover decodificare il JWT.
@@ -311,16 +371,16 @@ function emettiEmployeeToken({ barId, deviceId, employeeId, tier, sessionDuratio
   const payload = { barId, deviceId, employeeId, tier };
   const options = {};
   let expiresAt = null;
- 
+
   if (sessionDurationHours != null && sessionDurationHours > 0) {
     options.expiresIn = `${sessionDurationHours}h`;
     expiresAt = Date.now() + sessionDurationHours * 60 * 60 * 1000;
   }
- 
+
   const token = jwt.sign(payload, process.env.EMPLOYEE_JWT_SECRET, options);
   return { token, expiresAt };
 }
- 
+
 function verificaEmployeeToken(req, { barId, deviceId }) {
   const raw = req.headers["x-employee-token"];
   if (!raw) {
@@ -346,7 +406,7 @@ function verificaEmployeeToken(req, { barId, deviceId }) {
   }
   return payload;
 }
- 
+
 function richiedeManager(employeePayload) {
   if (!(employeePayload.tier > 900)) {
     const err = new Error("Permessi insufficienti (richiede owner o manager)");
@@ -354,7 +414,7 @@ function richiedeManager(employeePayload) {
     throw err;
   }
 }
- 
+
 // Il proprietario in sessione email+password è SEMPRE autorizzato (tier
 // virtuale 999, come da documento). Un dispositivo pairato deve invece
 // presentare un employee-token valido con tier>900 (owner o manager).
@@ -366,12 +426,13 @@ function richiedeManagerOAccessoOwner(req, accesso) {
   richiedeManager(emp);
   return emp;
 }
- 
+
 // Codice numerico leggibile, mostrato su entrambi gli schermi per
 // conferma umana in più rispetto al solo pairingToken.
 function generaCodiceVerifica() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
+
 // Pulizia opportunistica: le sessioni di pairing abbandonate (mai
 // scansionate, o scansionate ma mai approvate/negate) restavano per
 // sempre su Firestore. Non serve un cron esterno: ne cancelliamo un
@@ -385,7 +446,7 @@ async function pulisciSessioniPairingScadute(barId) {
       .where("scadeAt", "<", Date.now() - 5 * 60 * 1000) // margine di 5 minuti
       .limit(10)
       .get();
- 
+
     if (snap.empty) return;
     const batch = demasDb.batch();
     snap.docs.forEach((d) => batch.delete(d.ref));
@@ -394,7 +455,7 @@ async function pulisciSessioniPairingScadute(barId) {
     console.error("⚠️ Pulizia sessioni pairing fallita (non bloccante):", err.message);
   }
 }
- 
+
 /* ============================================================================
    POST /devices/pairing/start
    Chiamato dal dispositivo GIÀ autorizzato (owner o manager tier>900) per
@@ -405,7 +466,7 @@ app.post("/devices/pairing/start", async (req, res) => {
     const accesso = await resolveAccessoDispositivo(req);
     const { barId, deviceId } = accesso;
     const emp = richiedeManagerOAccessoOwner(req, accesso);
- 
+
     // Durata della sessione dipendente per i login PIN su QUESTO dispositivo,
     // scelta dall'owner/manager al momento del pairing. null = senza scadenza.
     const { sessionDurationHours } = req.body;
@@ -413,20 +474,20 @@ app.post("/devices/pairing/start", async (req, res) => {
       sessionDurationHours === null || sessionDurationHours === undefined
         ? null
         : Math.max(1, Math.min(168, Number(sessionDurationHours) || 12)); // clamp 1-168h (una settimana)
- 
+
     // Non blocca la risposta: se fallisce, va bene lo stesso, ritenteremo
     // al prossimo pairing.
     pulisciSessioniPairingScadute(barId);
- 
+
     const pairingId = crypto.randomUUID();
     const scadeAt = Date.now() + 3 * 60 * 1000; // 3 minuti
- 
+
     const pairingToken = jwt.sign(
       { pairingId, barId },
       process.env.PAIRING_JWT_SECRET,
       { expiresIn: "3m" }
     );
- 
+
     await demasDb.collection("pairingSessions").doc(pairingId).set({
       barId,
       status: "waiting_scan",
@@ -443,15 +504,14 @@ app.post("/devices/pairing/start", async (req, res) => {
       customToken: null,
       consumed: false,
     });
- 
+
     res.json({ pairingId, pairingToken, scadeAt });
   } catch (err) {
     console.error("❌ pairing/start:", err.message);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
- 
- 
+
 /* ============================================================================
    POST /devices/pairing/scan
    Chiamato dal dispositivo NUOVO (non ancora autorizzato) dopo aver
@@ -462,18 +522,18 @@ app.post("/devices/pairing/scan", async (req, res) => {
   try {
     const { pairingToken, deviceName, platform } = req.body;
     if (!pairingToken) return res.status(400).json({ error: "pairingToken mancante" });
- 
+
     let payload;
     try {
       payload = jwt.verify(pairingToken, process.env.PAIRING_JWT_SECRET);
     } catch {
       return res.status(410).json({ error: "QR scaduto o non valido" });
     }
- 
+
     const ref = demasDb.collection("pairingSessions").doc(payload.pairingId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: "Sessione di pairing non trovata" });
- 
+
     const sessione = snap.data();
     if (sessione.status !== "waiting_scan") {
       return res.status(409).json({ error: "QR già scansionato o non più valido" });
@@ -481,7 +541,7 @@ app.post("/devices/pairing/scan", async (req, res) => {
     if (sessione.scadeAt < Date.now()) {
       return res.status(410).json({ error: "QR scaduto" });
     }
- 
+
     const codice = generaCodiceVerifica();
     await ref.update({
       status: "waiting_approval",
@@ -490,13 +550,14 @@ app.post("/devices/pairing/scan", async (req, res) => {
       platform: (platform || "web").slice(0, 30),
       scannedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
- 
+
     res.json({ pairingId: payload.pairingId, code: codice });
   } catch (err) {
     console.error("❌ pairing/scan:", err.message);
     res.status(500).json({ error: "Errore durante la scansione" });
   }
 });
+
 /* ============================================================================
    GET /devices/pairing/owner-status/:pairingId
    Polling dal dispositivo OWNER/MANAGER che ha generato il QR, per vedere
@@ -507,13 +568,13 @@ app.get("/devices/pairing/owner-status/:pairingId", async (req, res) => {
     const accesso = await resolveAccessoDispositivo(req);
     const { barId, deviceId } = accesso;
     const emp = richiedeManagerOAccessoOwner(req, accesso);
- 
+
     const snap = await demasDb.collection("pairingSessions").doc(req.params.pairingId).get();
     if (!snap.exists) return res.status(404).json({ error: "Sessione non trovata" });
- 
+
     const sessione = snap.data();
     if (sessione.barId !== barId) return res.status(403).json({ error: "Non autorizzato" });
- 
+
     res.json({
       status: sessione.status,
       code: sessione.code,
@@ -526,6 +587,7 @@ app.get("/devices/pairing/owner-status/:pairingId", async (req, res) => {
     res.status(err.status || 500).json({ error: err.message });
   }
 });
+
 /* ============================================================================
    POST /devices/pairing/approve
    Il manager/owner conferma il codice mostrato → crea l'identità Firebase
@@ -536,16 +598,16 @@ app.post("/devices/pairing/approve", async (req, res) => {
     const accesso = await resolveAccessoDispositivo(req);
     const { barId, deviceId } = accesso;
     const emp = richiedeManagerOAccessoOwner(req, accesso);
- 
+
     const { pairingId, codeConferma, deviceLabel } = req.body;
     if (!pairingId || !codeConferma) {
       return res.status(400).json({ error: "pairingId o codice mancante" });
     }
- 
+
     const ref = demasDb.collection("pairingSessions").doc(pairingId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: "Sessione non trovata" });
- 
+
     const sessione = snap.data();
     if (sessione.barId !== barId) return res.status(403).json({ error: "Non autorizzato" });
     if (sessione.status !== "waiting_approval") {
@@ -558,16 +620,16 @@ app.post("/devices/pairing/approve", async (req, res) => {
     if (String(codeConferma).trim() !== sessione.code) {
       return res.status(400).json({ error: "Codice di conferma errato" });
     }
- 
+
     const newDeviceId = crypto.randomUUID();
- 
+
     // Nessun createUser esplicito necessario: createCustomToken funziona
     // anche su un uid che non esiste ancora, Firebase lo crea al primo login.
     const customToken = await demasApp.auth().createCustomToken(newDeviceId, {
       barId,
       deviceId: newDeviceId,
     });
- 
+
     await demasDb.collection("bars").doc(barId).collection("devices").doc(newDeviceId).set({
       name: (deviceLabel || sessione.deviceName || "Dispositivo").slice(0, 60),
       platform: sessione.platform || "web",
@@ -579,7 +641,7 @@ app.post("/devices/pairing/approve", async (req, res) => {
       pairedBy: emp.employeeId,
       lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
     });
- 
+
     await ref.update({
       status: "approved",
       approvedBy: emp.employeeId,
@@ -587,14 +649,14 @@ app.post("/devices/pairing/approve", async (req, res) => {
       customToken,
       consumed: false,
     });
- 
+
     res.json({ success: true, deviceId: newDeviceId });
   } catch (err) {
     console.error("❌ pairing/approve:", err.message);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
- 
+
 /* ============================================================================
    POST /devices/pairing/deny
    Il manager rifiuta il codice/dispositivo (es. codice non coincide di
@@ -605,14 +667,14 @@ app.post("/devices/pairing/deny", async (req, res) => {
     const accesso = await resolveAccessoDispositivo(req);
     const { barId, deviceId } = accesso;
     const emp = richiedeManagerOAccessoOwner(req, accesso);
- 
+
     const { pairingId } = req.body;
     const ref = demasDb.collection("pairingSessions").doc(pairingId);
     const snap = await ref.get();
     if (!snap.exists || snap.data().barId !== barId) {
       return res.status(404).json({ error: "Sessione non trovata" });
     }
- 
+
     await ref.update({ status: "denied" });
     res.json({ success: true });
   } catch (err) {
@@ -620,6 +682,7 @@ app.post("/devices/pairing/deny", async (req, res) => {
     res.status(err.status || 500).json({ error: err.message });
   }
 });
+
 /* ============================================================================
    POST /devices/pairing/redeem
    Chiamato in polling dal dispositivo NUOVO con il pairingToken ottenuto
@@ -630,20 +693,20 @@ app.post("/devices/pairing/redeem", async (req, res) => {
   try {
     const { pairingToken } = req.body;
     if (!pairingToken) return res.status(400).json({ error: "pairingToken mancante" });
- 
+
     let payload;
     try {
       payload = jwt.verify(pairingToken, process.env.PAIRING_JWT_SECRET);
     } catch {
       return res.status(410).json({ error: "QR scaduto" });
     }
- 
+
     const ref = demasDb.collection("pairingSessions").doc(payload.pairingId);
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: "Sessione non trovata" });
- 
+
     const sessione = snap.data();
- 
+
     if (sessione.status === "denied") return res.json({ status: "denied" });
     if (sessione.status === "expired" || sessione.scadeAt < Date.now()) {
       return res.json({ status: "expired" });
@@ -655,10 +718,10 @@ app.post("/devices/pairing/redeem", async (req, res) => {
       // Già ritirato in precedenza: non riconsegnare mai due volte un customToken
       return res.status(409).json({ error: "Token già utilizzato" });
     }
- 
+
     // Consuma atomicamente per evitare doppia consegna in caso di poll concorrenti
     await ref.update({ consumed: true });
- 
+
     res.json({
       status: "approved",
       customToken: sessione.customToken,
@@ -670,6 +733,7 @@ app.post("/devices/pairing/redeem", async (req, res) => {
     res.status(500).json({ error: "Errore durante il recupero del token" });
   }
 });
+
 /* ============================================================================
    GET /devices/list
    Lista dispositivi autorizzati per il locale — solo owner/manager.
@@ -679,7 +743,7 @@ app.get("/devices/list", async (req, res) => {
     const accesso = await resolveAccessoDispositivo(req);
     const { barId, deviceId } = accesso;
     const emp = richiedeManagerOAccessoOwner(req, accesso);
- 
+
     const snap = await demasDb.collection("bars").doc(barId).collection("devices").get();
     const devices = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     res.json({ devices });
@@ -688,7 +752,7 @@ app.get("/devices/list", async (req, res) => {
     res.status(err.status || 500).json({ error: err.message });
   }
 });
- 
+
 /* ============================================================================
    POST /devices/revoke
    Revoca immediata: disabilita l'utente Firebase del device (blocca anche i
@@ -699,31 +763,39 @@ app.post("/devices/revoke", async (req, res) => {
     const accesso = await resolveAccessoDispositivo(req);
     const { barId, deviceId } = accesso;
     const emp = richiedeManagerOAccessoOwner(req, accesso);
- 
+
     const { targetDeviceId } = req.body;
     if (!targetDeviceId) return res.status(400).json({ error: "targetDeviceId mancante" });
- 
+
     const targetRef = demasDb.collection("bars").doc(barId).collection("devices").doc(targetDeviceId);
     const targetSnap = await targetRef.get();
     if (!targetSnap.exists) return res.status(404).json({ error: "Dispositivo non trovato" });
- 
+
     await targetRef.update({
       status: "revoked",
       revokedAt: admin.firestore.FieldValue.serverTimestamp(),
       revokedBy: emp.employeeId,
     });
- 
+
     // Invalida qualsiasi ID token del device già emesso, anche se non ancora scaduto
     await demasApp.auth().revokeRefreshTokens(targetDeviceId).catch(() => {});
     await demasApp.auth().updateUser(targetDeviceId, { disabled: true }).catch(() => {});
- 
+
+    // Kick in tempo reale: revokeRefreshTokens/disabled bloccano il device
+    // solo alla PROSSIMA richiesta autenticata (fino a ~1h se il suo ID
+    // token corrente non è ancora scaduto) — questo segnale RTDB lo fa
+    // uscire nel giro di pochi secondi, se è online in quel momento.
+    await demasRtdb.ref(`deviceKick/${barId}/${targetDeviceId}`)
+      .set({ kicked: true, at: Date.now() })
+      .catch((err) => console.error("⚠️ Scrittura deviceKick fallita (non bloccante):", err.message));
+
     res.json({ success: true });
   } catch (err) {
     console.error("❌ devices/revoke:", err.message);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
- 
+
 /* ============================================================================
    POST /devices/employee-login
    Login del dipendente SUL device già associato — PIN hashato (bcrypt),
@@ -736,7 +808,7 @@ app.post("/devices/employee-login", async (req, res) => {
     const { barId, deviceId } = accesso;
     const { employeeId, pin } = req.body;
     if (!employeeId || !pin) return res.status(400).json({ error: "Dati mancanti" });
- 
+
     // Durata sessione configurata sul device in fase di pairing (null =
     // senza scadenza). Le sessioni owner (email+password) non hanno un
     // documento "device" — restano senza scadenza, coerente col fatto che
@@ -746,13 +818,13 @@ app.post("/devices/employee-login", async (req, res) => {
       const deviceSnap = await demasDb.collection("bars").doc(barId).collection("devices").doc(deviceId).get();
       sessionDurationHours = deviceSnap.exists ? deviceSnap.data().sessionDurationHours ?? null : null;
     }
- 
+
     const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
- 
+
     const risultato = await demasDb.runTransaction(async (tx) => {
       const snap = await tx.get(infoRef);
       if (!snap.exists) throw Object.assign(new Error("Locale non trovato"), { status: 404 });
- 
+
       const employees = snap.data().employees || [];
       const found = employees.find((e) => e.id === employeeId);
       if (!found) throw Object.assign(new Error("Dipendente non valido"), { status: 404 });
@@ -762,9 +834,9 @@ app.post("/devices/employee-login", async (req, res) => {
           { status: 403 }
         );
       }
- 
+
       const pinOk = found.pinHash ? await bcrypt.compare(String(pin), found.pinHash) : false;
- 
+
       if (!pinOk) {
         const nuoviTentativi = (found.loginAttempts || 0) + 1;
         const bloccato = nuoviTentativi >= 5;
@@ -777,19 +849,19 @@ app.post("/devices/employee-login", async (req, res) => {
           { status: 401 }
         );
       }
- 
+
       const updated = employees.map((e) =>
         e.id === employeeId ? { ...e, loginAttempts: 0, blocked: false } : e
       );
       tx.set(infoRef, { employees: updated }, { merge: true });
- 
+
       return { id: found.id, name: found.name, role: found.role, tier: found.tier, permissions: found.permissions };
     });
- 
+
     await demasDb.collection("bars").doc(barId).collection("devices").doc(deviceId)
       .update({ lastSeenAt: admin.firestore.FieldValue.serverTimestamp() })
       .catch(() => {});
- 
+
     const employeeTokenResult = emettiEmployeeToken({
       barId,
       deviceId,
@@ -797,7 +869,7 @@ app.post("/devices/employee-login", async (req, res) => {
       tier: risultato.tier,
       sessionDurationHours,
     });
- 
+
     res.json({
       success: true,
       employee: risultato,
@@ -809,8 +881,6 @@ app.post("/devices/employee-login", async (req, res) => {
     res.status(err.status || 500).json({ error: err.message });
   }
 });
-
-
 
 /* ============================================================================
    POST /employees/set-pin
@@ -824,24 +894,24 @@ app.post("/employees/set-pin", async (req, res) => {
     const accesso = await resolveAccessoDispositivo(req);
     const { barId } = accesso;
     richiedeManagerOAccessoOwner(req, accesso);
- 
+
     const { employeeId, pin } = req.body;
     if (!employeeId || !pin) return res.status(400).json({ error: "Dati mancanti" });
     if (!/^\d{4,6}$/.test(String(pin))) {
       return res.status(400).json({ error: "Il PIN deve avere tra 4 e 6 cifre numeriche" });
     }
- 
+
     const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
     const pinHash = await bcrypt.hash(String(pin), 10);
- 
+
     await demasDb.runTransaction(async (tx) => {
       const snap = await tx.get(infoRef);
       if (!snap.exists) throw Object.assign(new Error("Locale non trovato"), { status: 404 });
- 
+
       const employees = snap.data().employees || [];
       const found = employees.find((e) => e.id === employeeId);
       if (!found) throw Object.assign(new Error("Dipendente non trovato"), { status: 404 });
- 
+
       // FieldValue.delete() non funziona dentro un array (limite Firestore):
       // per rimuovere il vecchio campo "password" in chiaro dobbiamo
       // ricostruire l'oggetto senza quella chiave, non usare delete().
@@ -850,21 +920,16 @@ app.post("/employees/set-pin", async (req, res) => {
         const { password, ...rest } = e;
         return { ...rest, pinHash, loginAttempts: 0, blocked: false };
       });
- 
+
       tx.set(infoRef, { employees: cleaned }, { merge: true });
     });
- 
+
     res.json({ success: true });
   } catch (err) {
     console.error("❌ employees/set-pin:", err.message);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
-
-
-
-
-
 
 
 
