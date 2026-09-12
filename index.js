@@ -1449,16 +1449,64 @@ app.post("/send-order", async (req, res) => {
       return res.status(409).json({ error: "sessione_non_valida", scollega: true });
     }
 
+    // ── Risolvi cliente preferito (query mirate, niente full scan) ──
+    const emailNorm = String(decoded.email || "").trim().toLowerCase();
+    const telNorm = String(userData.phone || "").trim();
+    // opzionale: se in futuro il client lo manda nel body
+    const clientePreferitoIdBody =
+      typeof req.body.clientePreferitoId === "string" && req.body.clientePreferitoId.trim()
+        ? req.body.clientePreferitoId.trim()
+        : null;
+
+    let clientePreferitoId = null;
+    try {
+      const preferitiCol = demasDb
+        .collection("bars")
+        .doc(localeId)
+        .collection("clientiPreferiti"); // ← verifica nome collection in useClientiPreferiti
+
+      // 1) ID esplicito dal client (se presente e valido per questo locale)
+      if (clientePreferitoIdBody) {
+        const snap = await preferitiCol.doc(clientePreferitoIdBody).get();
+        if (snap.exists) clientePreferitoId = snap.id;
+      }
+
+      // 2) Match per email (caso più comune per utenti app autenticati)
+      if (!clientePreferitoId && emailNorm) {
+        const byEmail = await preferitiCol
+          .where("email", "==", emailNorm)
+          .limit(1)
+          .get();
+        if (!byEmail.empty) clientePreferitoId = byEmail.docs[0].id;
+      }
+
+      // 3) Fallback telefono
+      if (!clientePreferitoId && telNorm) {
+        const byTel = await preferitiCol
+          .where("telefono", "==", telNorm)
+          .limit(1)
+          .get();
+        if (!byTel.empty) clientePreferitoId = byTel.docs[0].id;
+      }
+    } catch (e) {
+      console.error("lookup clientePreferito:", e);
+      // non bloccare l'ordine se il lookup fallisce
+    }
+
     await demasDb
-      .collection("bars").doc(localeId)
-      .collection("ordini").doc(ordineId)
+      .collection("bars")
+      .doc(localeId)
+      .collection("ordini")
+      .doc(ordineId)
       .set({
         cliente: {
           uid: decoded.uid,
+          id: clientePreferitoId, // allinea a ciò che legge ListaOrdini
           email: String(decoded.email || "").slice(0, 120),
           nome: String(guestName || userData.ownerName || "").slice(0, 80),
           telefono: String(userData.phone || "").slice(0, 30),
         },
+        clientePreferitoId: clientePreferitoId, // ← chiave usata da ListaOrdini
         tavolo: tavoloRisolto,
         note: note || noteCliente || null,
         tableId: tableId ?? null,
@@ -1475,7 +1523,7 @@ app.post("/send-order", async (req, res) => {
         source: "appbase",
       });
 
-    res.json({ success: true });
+    res.json({ success: true });  
   } catch (err) {
     console.error(err);
     return res.status(403).json({ error: "token non valido" });
