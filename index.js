@@ -276,7 +276,7 @@ app.get("/", (req, res) => {
       leggono/scrivono `pinHash` (bcrypt). Serve un endpoint separato per
       creare/cambiare il PIN di un dipendente (lato SettingsPanel.tsx) che
       hasha lato server — dimmi quando vuoi che lo scriva, non l'ho incluso
-      qui perché non ho ancora visto quel file.
+      qui perché non ho ancora visto quel file. 
 
    6. NOVITÀ — kick immediato dispositivo revocato: serve accesso RTDB
       dall'Admin SDK, che il tuo index.js oggi non ha (solo Firestore).
@@ -301,6 +301,9 @@ app.get("/", (req, res) => {
 // dispositivi revocati, vedi punto 6 sopra.
 const demasRtdb = demasApp.database();
 
+
+const { creaOrdiniGuard } = require("./ordiniGuard.mjs");
+const ordiniGuard = creaOrdiniGuard({ demasDb, appbaseDb });
 /* ============================================================================
    HELPERS AUTH — DEVICE (Firebase custom auth per-dispositivo) O OWNER
    (Firebase email+password classico, resta sempre disponibile per il
@@ -942,72 +945,16 @@ app.post("/employees/set-pin", async (req, res) => {
 
 
 
-{/**app.post("/sync-menu", async (req, res) => {
-  try {
-    if (req.body.secret !== API_KEY) {
-      return res.status(403).json({ error: "unauthorized" });
-    }
 
-    const {
-      localeId,
-      companyName,
-      categorie = [],
-      sottocategorie = [],
-      prodotti = [],
-        publicMenus = null,  
-    } = req.body;
-
-// sostituisci il blocco set() in /sync-menu
-const updateData = {
-  companyName: companyName || "Senza Nome",
-  categorie,
-  sottocategorie,
-  prodotti,
-  updatedAt: Date.now(),
-};
-
-if (publicMenus) {
-  updateData.orari = publicMenus.orari || {};
-  updateData.chiusure = publicMenus.chiusure || [];
-  updateData.chiusurePeriodo = publicMenus.chiusurePeriodo || null;
-  updateData.offerte = publicMenus.offerte || [];
-  updateData.menuPubblicoAttivo = publicMenus.menuPubblicoAttivo || false;
-}
-
-await appbaseDb.collection("publicMenus").doc(localeId).set(updateData, { merge: true });
-
-
-{/** await appbaseDb.collection("publicMenus").doc(localeId).set({
-      companyName: companyName || "Senza Nome",
-      categorie,
-      sottocategorie,
-      prodotti,
-
-       orari: publicMenus?.orari || {},
-  chiusure: publicMenus?.chiusure || [],
-  offerte: publicMenus?.offerte || [],
-  menuPubblicoAttivo: publicMenus?.menuPubblicoAttivo || false,
-  
-      updatedAt: Date.now(),
-    });
- */}
-   
-  //  res.json({ success: true });
-  //} catch (err) {
-   // console.error(err);
-   // res.status(500).json({ error: "server error" });
- // }
-//}); 
-//*/}
-/* =========================
-   SYNC MENU (DEMAS → APPBASE)
-========================= prev versione^ */
+// ── 2) /sync-menu — SOSTITUISCE l'intero endpoint ────────────────────────────
+// Prima copiava solo orari/chiusure/offerte: senza questa modifica NESSUN campo nuovo
+// (doppi turni, orari menu, chiusure con etichetta, ordini) arriva ad AppBase.
 app.post("/sync-menu", async (req, res) => {
   try {
     if (req.body.secret !== API_KEY) {
       return res.status(403).json({ error: "unauthorized" });
     }
-
+ 
     const {
       localeId,
       companyName,
@@ -1016,11 +963,11 @@ app.post("/sync-menu", async (req, res) => {
       prodotti = [],
       publicMenus = null,
     } = req.body;
-
+ 
     if (!localeId) {
       return res.status(400).json({ error: "localeId mancante" });
     }
-
+ 
     const updateData = {
       companyName: companyName || "Senza Nome",
       categorie,
@@ -1028,16 +975,14 @@ app.post("/sync-menu", async (req, res) => {
       prodotti,
       updatedAt: Date.now(),
     };
-
+ 
     if (publicMenus) {
-      updateData.orari = publicMenus.orari || {};
-      updateData.chiusure = publicMenus.chiusure || [];
-      updateData.chiusurePeriodo = publicMenus.chiusurePeriodo || null;
-      updateData.offerte = publicMenus.offerte || [];
-      updateData.menuPubblicoAttivo = publicMenus.menuPubblicoAttivo || false;
-      updateData.pagamentoLocaleAttivo = publicMenus.pagamentoLocaleAttivo !== false;
-
-      // Salvataggio delivery completa
+      // invalida() prima: se il gestore ha appena cambiato piano, qui si rilegge (1 lettura per sync, che è rara)
+      ordiniGuard.invalida(localeId);
+      const ordiniConsentiti = await ordiniGuard.pianoConsenteOrdini(localeId);
+      Object.assign(updateData, ordiniGuard.campiPubbliciDaSync(publicMenus, ordiniConsentiti));
+ 
+      // Salvataggio delivery completa (invariato)
       if (publicMenus.delivery) {
         updateData.delivery = {
           ...publicMenus.delivery,
@@ -1045,15 +990,17 @@ app.post("/sync-menu", async (req, res) => {
         };
       }
     }
-
+ 
     await appbaseDb.collection("publicMenus").doc(localeId).set(updateData, { merge: true });
-
+    ordiniGuard.invalida(localeId); // il prossimo ordine vede subito il nuovo stato
+ 
     res.json({ success: true, message: "Menu sincronizzato correttamente" });
   } catch (err) {
     console.error("Errore sync-menu:", err);
     res.status(500).json({ error: "server error" });
   }
 });
+ 
 /* =========================
    HELPER: distanza in metri (haversine)
 ========================= */
@@ -1149,56 +1096,7 @@ function verificaCoerenzaGeografica({ paeseDichiarato, ip, gpsPaese }) {
   };
 }
 
-/* =========================
-   CREATE PAYMENT INTENT (Stripe)
-   POST /create-payment-intent
-   Body: { token, totale, localeId }
-   Returns: { clientSecret }
-========================= */
 
-{/*prev...
- app.post("/create-payment-intent", async (req, res) => {
-  try {
-    const { token, prodotti, localeId } = req.body;
-
-    if (!token) {
-      return res.status(401).json({ error: "Utente non autenticato" });
-    }
-
-    const decoded = await appbaseApp.auth().verifyIdToken(token);
-
-    if (!localeId) {
-      return res.status(400).json({ error: "localeId mancante" });
-    }
-    if (!Array.isArray(prodotti) || prodotti.length === 0) {
-      return res.status(400).json({ error: "prodotti mancanti" });
-    }
-
-    const verificato = await verificaEcorreggiProdotti(localeId, prodotti);
-    if (!verificato) {
-      return res.status(400).json({ error: "Prodotti non riconosciuti nel menu" });
-    }
-
-    const importoCentesimi = Math.round(verificato.totale * 100);
-    if (!importoCentesimi || importoCentesimi < 50) {
-      return res.status(400).json({ error: "Importo non valido (minimo 0.50€)" });
-    }
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: importoCentesimi,
-      currency: "eur",
-      automatic_payment_methods: { enabled: true },
-      metadata: { localeId, uid: decoded.uid, email: decoded.email || "" },
-    });
-
-    res.json({ clientSecret: paymentIntent.client_secret, totaleVerificato: verificato.totale });
-  } catch (err) {
-    console.error("❌ Stripe error:", err);
-    res.status(500).json({ error: "Errore creazione pagamento" });
-  }
-}); 
-  
-  */}
 /* =========================
    BILLING — SINCRONIZZA PIANO (recovery/safety-net)
    POST /billing/sync-plan
@@ -1257,7 +1155,13 @@ app.post("/create-payment-intent", async (req, res) => {
     if (!Array.isArray(prodotti) || prodotti.length === 0) {
       return res.status(400).json({ error: "prodotti mancanti" });
     }
-
+    try {
+      const esito = await ordiniGuard.verificaOrdiniConsentiti(localeId, decoded.email);
+      if (!esito.ok) return res.status(esito.status).json({ error: esito.error });
+    } catch (e) {
+      console.error("ordiniGuard (payment-intent):", e);
+      return res.status(503).json({ error: "servizio_non_disponibile" });
+    }
     // Sessione tavolo → blocca PRIMA di autorizzare qualunque addebito
     if (tableId != null) {
       try {
@@ -1339,7 +1243,14 @@ app.post("/send-order", async (req, res) => {
     if (!Array.isArray(prodotti) || prodotti.length === 0) {
       return res.status(400).json({ error: "prodotti mancanti" });
     }
-
+try {
+      const pagatoConCarta = metodoPagamento === "Paga con carta" && !!stripePaymentIntentId;
+      const esito = await ordiniGuard.verificaOrdiniConsentiti(localeId, decoded.email, { giaPagato: pagatoConCarta });
+      if (!esito.ok) return res.status(esito.status).json({ error: esito.error });
+    } catch (e) {
+      console.error("ordiniGuard (send-order):", e);
+      return res.status(503).json({ error: "servizio_non_disponibile" });
+    }
     // Non ci fidiamo mai di prezzi/totale dal client: ricalcoliamo dal menu reale
     const verificato = await verificaEcorreggiProdotti(localeId, prodotti);
     if (!verificato) {
@@ -1530,286 +1441,11 @@ app.post("/send-order", async (req, res) => {
   }
 });
 
-{/* app.post("/send-order", async (req, res) => {
-  try {
-    const { token } = req.body;
-
-    if (!token) {
-      return res.status(401).json({ error: "Utente non autenticato" });
-    }
-
-    const decoded = await appbaseApp.auth().verifyIdToken(token);
-
-    const userDoc = await appbaseDb.collection("users").doc(decoded.uid).get();
-    const userData = userDoc.data() || {};
-
-    const {
-      localeId,
-      tavolo,
-      prodotti,
-      totale,
-      metodoPagamento,
-      timestamp,
-      tableId,
-      sessionToken,
-      guestName,
-      lat,
-      lng,
-      stripePaymentIntentId, // opzionale: passato dal frontend dopo pagamento confermato
-    } = req.body;
-
-    if (!localeId) {
-      return res.status(400).json({ error: "localeId mancante" });
-    }
-
-    if (!Array.isArray(prodotti) || prodotti.length === 0) {
-      return res.status(400).json({ error: "prodotti mancanti" });
-    }
-
-    // Se il metodo è "carta" verifica che il PaymentIntent sia confermato
-  // Se il metodo è "carta" verifica che il PaymentIntent sia confermato
-    if (metodoPagamento === "Paga con carta") {
-      if (!stripePaymentIntentId) {
-        console.error("❌ carta: stripePaymentIntentId mancante nel body");
-        return res.status(400).json({ error: "Pagamento non completato" });
-      }
-      try {
-        const intent = await stripe.paymentIntents.retrieve(stripePaymentIntentId);
-        if (intent.status !== "succeeded") {
-          console.error("⚠️ PaymentIntent non succeeded:", stripePaymentIntentId, "status:", intent.status);
-          return res.status(402).json({ error: "Pagamento non confermato da Stripe", status: intent.status });
-        }
-      } catch (stripeErr) {
-        console.error("❌ Errore verifica Stripe:", stripeErr.message, "id ricevuto:", stripePaymentIntentId);
-        return res.status(402).json({ error: "Errore verifica pagamento Stripe" });
-      }
-    }
-
-    // ── Risoluzione tavolo + verifica sessione + geofence ── 
-    let tavoloRisolto = tavolo || "";
-    let noteCliente = null;
-    let daVerificare = false;
-    let spam = false;
-
-    if (tableId != null) {
-      noteCliente = tavolo || null;
-
-      try {
-        const sessioneSnap = await demasDb
-          .collection("bars").doc(localeId)
-          .collection("sessioniTavolo").doc(String(tableId))
-          .get();
-
-        let sessioneValida = false;
-        if (sessioneSnap.exists) {
-          const sessione = sessioneSnap.data();
-          const ora = Date.now();
-          sessioneValida =
-            sessione.attivo === true &&
-            sessione.token === sessionToken &&
-            (sessione.scadeAt == null || sessione.scadeAt > ora);
-        }
-
-        if (!sessioneValida) {
-          spam = true;
-        } else {
-          const localeSnap = await demasDb
-            .collection("bars").doc(localeId)
-            .collection("meta").doc("locale")
-            .get();
-
-          if (localeSnap.exists) {
-            const localeData = localeSnap.data();
-            if (
-              typeof localeData.lat === "number" &&
-              typeof localeData.lng === "number" &&
-              typeof lat === "number" &&
-              typeof lng === "number"
-            ) {
-              const raggio = localeData.raggioMetri || 150;
-              const distanza = distanzaMetri(lat, lng, localeData.lat, localeData.lng);
-              if (distanza > raggio) daVerificare = true;
-            }
-          }
-        }
-
-        const tavoloSnap = await demasDb
-          .collection("bars").doc(localeId)
-          .collection("tavoli").doc(String(tableId))
-          .get();
-        if (tavoloSnap.exists) {
-          tavoloRisolto = tavoloSnap.data().nome || `Tavolo ${tableId}`;
-        }
-      } catch (err) {
-        console.error("Errore validazione sessione tavolo:", err);
-        daVerificare = true;
-      }
-    }
-
-    // ── Genera ordineId ── 
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat("it-IT", {
-      timeZone: "Europe/Rome",
-      day: "2-digit", month: "2-digit",
-      hour: "2-digit", minute: "2-digit",
-    });
-    const parts = formatter.formatToParts(now);
-    const get = (type) => parts.find((p) => p.type === type)?.value || "00";
-    const ordineId = `${get("day")}-${get("month")}_${get("hour")}-${get("minute")}_${
-      String(decoded.email || "utente").replace(/[@.]/g, "-").slice(0, 40)
-    }_${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-
-    await demasDb
-      .collection("bars").doc(localeId)
-      .collection("ordini").doc(ordineId)
-      .set({
-        cliente: {
-          uid: decoded.uid,
-          email: String(decoded.email || "").slice(0, 120),
-          nome: String(guestName || userData.ownerName || "").slice(0, 80),
-          telefono: String(userData.phone || "").slice(0, 30),
-        },
-        tavolo: tavoloRisolto,
-        note: noteCliente,
-        tableId: tableId ?? null,
-        daVerificare,
-        spam,
-        prodotti,
-        totale,
-        metodoPagamento,
-        // traccia il pagamento Stripe se presente
-        stripePaymentIntentId: stripePaymentIntentId || null,
-        timestamp: timestamp || Date.now(),
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        status: "nuovo",
-        source: "appbase",
-      });
-
-    if (spam) {
-      return res.status(409).json({ error: "sessione_non_valida", scollega: true });
-    }
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    return res.status(403).json({ error: "token non valido" });
-  }
-}); */}
 
 
 
-{/* prev: *app.post("/send-order", async (req, res) => {
-  try {
-
-    const { token } = req.body;
-
-    if (!token) {
-      return res.status(401).json({
-        error: "Utente non autenticato"
-      });
-    }
-
-    const decoded = await appbaseApp
-      .auth()
-      .verifyIdToken(token);
 
 
-    const userDoc = await appbaseDb
-  .collection("users")
-  .doc(decoded.uid)
-  .get();
-
-const userData = userDoc.data() || {};
-
-    const {
-      localeId,
-      tavolo,
-      prodotti,
-      totale,
-      metodoPagamento,
-      timestamp
-    } = req.body;
-
-    if (!localeId) {
-      return res.status(400).json({
-        error: "localeId mancante"
-      });
-    }
-
-    if (!Array.isArray(prodotti) || prodotti.length === 0) {
-      return res.status(400).json({
-        error: "prodotti mancanti"
-      });
-    }
-
-const now = new Date();
-
-const formatter = new Intl.DateTimeFormat("it-IT", {
-  timeZone: "Europe/Rome",
-  day: "2-digit",
-  month: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-});
-
-const parts = formatter.formatToParts(now);
-
-const get = (type) =>
-  parts.find(p => p.type === type)?.value || "00";
-
-const giorno = get("day");
-const mese = get("month");
-const ora = get("hour");
-const minuti = get("minute");
-
-const emailSafe = String(decoded.email || "utente")
-  .replace(/[@.]/g, "-")
-  .slice(0, 40);
-
-const randomId = Math.random()
-  .toString(36)
-  .substring(2, 8)
-  .toUpperCase();
-
-const ordineId =
-  `${giorno}-${mese}_${ora}-${minuti}_${emailSafe}_${randomId}`;
-
-await demasDb
-  .collection("bars")
-  .doc(localeId)
-.collection("ordini")
-.doc(ordineId)
-.set({
-cliente: {
-  uid: decoded.uid,
-  email: String(decoded.email || "").slice(0, 120),
-  nome: String(userData.ownerName || "").slice(0, 80),
-  telefono: String(userData.phone || "").slice(0, 30),
-},
-
-    tavolo,
-    prodotti,
-    totale,
-    metodoPagamento,
-
-    timestamp: timestamp || Date.now(),
-
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-
-    status: "nuovo",
-    source: "appbase"
-  });
-
-    res.json({ success: true });
-
-  } catch (err) {
-
-    console.error(err);
-return res.status(403).json({
-  error: "token non valido"
-});
-  }
-}); */}
 
 app.get("/resolve-table/:token", async (req, res) => {
   try {
