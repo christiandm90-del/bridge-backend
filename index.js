@@ -302,7 +302,7 @@ app.get("/", (req, res) => {
 const demasRtdb = demasApp.database();
 
 
-const { creaOrdiniGuard } = require("./ordiniGuard.mjs");
+const { creaOrdiniGuard } = require("./ordiniGuard.cjs");
 const ordiniGuard = creaOrdiniGuard({ demasDb, appbaseDb });
 /* ============================================================================
    HELPERS AUTH — DEVICE (Firebase custom auth per-dispositivo) O OWNER
@@ -949,6 +949,7 @@ app.post("/employees/set-pin", async (req, res) => {
 // ── 2) /sync-menu — SOSTITUISCE l'intero endpoint ────────────────────────────
 // Prima copiava solo orari/chiusure/offerte: senza questa modifica NESSUN campo nuovo
 // (doppi turni, orari menu, chiusure con etichetta, ordini) arriva ad AppBase.
+
 app.post("/sync-menu", async (req, res) => {
   try {
     if (req.body.secret !== API_KEY) {
@@ -977,7 +978,7 @@ app.post("/sync-menu", async (req, res) => {
     };
  
     if (publicMenus) {
-      // invalida() prima: se il gestore ha appena cambiato piano, qui si rilegge (1 lettura per sync, che è rara)
+      // invalida() prima: se il gestore ha appena cambiato piano si rilegge (1 lettura per sync, che è rara)
       ordiniGuard.invalida(localeId);
       const ordiniConsentiti = await ordiniGuard.pianoConsenteOrdini(localeId);
       Object.assign(updateData, ordiniGuard.campiPubbliciDaSync(publicMenus, ordiniConsentiti));
@@ -1000,6 +1001,7 @@ app.post("/sync-menu", async (req, res) => {
     res.status(500).json({ error: "server error" });
   }
 });
+ 
  
 /* =========================
    HELPER: distanza in metri (haversine)
@@ -1142,19 +1144,21 @@ app.post("/billing/sync-plan", async (req, res) => {
 app.post("/create-payment-intent", async (req, res) => {
   try {
     const { token, prodotti, localeId, tableId, sessionToken } = req.body;
-
+ 
     if (!token) {
       return res.status(401).json({ error: "Utente non autenticato" });
     }
-
+ 
     const decoded = await appbaseApp.auth().verifyIdToken(token);
-
+ 
     if (!localeId) {
       return res.status(400).json({ error: "localeId mancante" });
     }
     if (!Array.isArray(prodotti) || prodotti.length === 0) {
       return res.status(400).json({ error: "prodotti mancanti" });
     }
+ 
+    // ✅ NUOVO: piano / ordini attivi / orari / pausa / cliente bloccato (cache in memoria, ~0 letture a regime)
     try {
       const esito = await ordiniGuard.verificaOrdiniConsentiti(localeId, decoded.email);
       if (!esito.ok) return res.status(esito.status).json({ error: esito.error });
@@ -1162,6 +1166,7 @@ app.post("/create-payment-intent", async (req, res) => {
       console.error("ordiniGuard (payment-intent):", e);
       return res.status(503).json({ error: "servizio_non_disponibile" });
     }
+ 
     // Sessione tavolo → blocca PRIMA di autorizzare qualunque addebito
     if (tableId != null) {
       try {
@@ -1169,7 +1174,7 @@ app.post("/create-payment-intent", async (req, res) => {
           .collection("bars").doc(localeId)
           .collection("sessioniTavolo").doc(String(tableId))
           .get();
-
+ 
         let sessioneValida = false;
         if (sessioneSnap.exists) {
           const sessione = sessioneSnap.data();
@@ -1179,7 +1184,7 @@ app.post("/create-payment-intent", async (req, res) => {
             sessione.token === sessionToken &&
             (sessione.scadeAt == null || sessione.scadeAt > ora);
         }
-
+ 
         if (!sessioneValida) {
           return res.status(409).json({ error: "sessione_non_valida", scollega: true });
         }
@@ -1188,24 +1193,24 @@ app.post("/create-payment-intent", async (req, res) => {
         return res.status(409).json({ error: "sessione_non_valida", scollega: true });
       }
     }
-
+ 
     const verificato = await verificaEcorreggiProdotti(localeId, prodotti);
     if (!verificato) {
       return res.status(400).json({ error: "Prodotti non riconosciuti nel menu" });
     }
-
+ 
     const importoCentesimi = Math.round(verificato.totale * 100);
     if (!importoCentesimi || importoCentesimi < 50) {
       return res.status(400).json({ error: "Importo non valido (minimo 0.50€)" });
     }
-
+ 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: importoCentesimi,
       currency: "eur",
       automatic_payment_methods: { enabled: true },
       metadata: { localeId, uid: decoded.uid, email: decoded.email || "" },
     });
-
+ 
     res.json({ clientSecret: paymentIntent.client_secret, totaleVerificato: verificato.totale });
   } catch (err) {
     console.error("❌ Stripe error:", err);
@@ -1219,38 +1224,46 @@ app.post("/create-payment-intent", async (req, res) => {
    SEND ORDER (APPBASE → DEMAS)
 ========================= */
 app.post("/send-order", async (req, res) => {
+  const { token } = req.body;
+  if (!token) {
+    return res.status(401).json({ error: "Utente non autenticato" });
+  }
+ 
+  let decoded;
   try {
-    const { token } = req.body;
-
-    if (!token) {
-      return res.status(401).json({ error: "Utente non autenticato" });
-    }
-
-    const decoded = await appbaseApp.auth().verifyIdToken(token);
-
+    decoded = await appbaseApp.auth().verifyIdToken(token);
+  } catch (e) {
+    return res.status(403).json({ error: "token non valido" });
+  }
+ 
+  try {
     const userDoc = await appbaseDb.collection("users").doc(decoded.uid).get();
     const userData = userDoc.data() || {};
-
+ 
     const {
       localeId, tavolo, prodotti, metodoPagamento, timestamp,
       tableId, sessionToken, guestName, lat, lng, stripePaymentIntentId,
-      note, 
+      note,
     } = req.body;
-
+ 
     if (!localeId) {
       return res.status(400).json({ error: "localeId mancante" });
     }
     if (!Array.isArray(prodotti) || prodotti.length === 0) {
       return res.status(400).json({ error: "prodotti mancanti" });
     }
-try {
-      const pagatoConCarta = metodoPagamento === "Paga con carta" && !!stripePaymentIntentId;
+ 
+    // ✅ NUOVO: gli ordini con carta già incassata passano (il via libera è stato dato alla creazione del PaymentIntent:
+    // rifiutarli ora vorrebbe dire tenere i soldi senza ordine). Tutto il resto, incluso "pagherò nel locale", è controllato.
+    const pagatoConCarta = metodoPagamento === "Paga con carta" && !!stripePaymentIntentId;
+    try {
       const esito = await ordiniGuard.verificaOrdiniConsentiti(localeId, decoded.email, { giaPagato: pagatoConCarta });
       if (!esito.ok) return res.status(esito.status).json({ error: esito.error });
     } catch (e) {
       console.error("ordiniGuard (send-order):", e);
       return res.status(503).json({ error: "servizio_non_disponibile" });
     }
+ 
     // Non ci fidiamo mai di prezzi/totale dal client: ricalcoliamo dal menu reale
     const verificato = await verificaEcorreggiProdotti(localeId, prodotti);
     if (!verificato) {
@@ -1259,10 +1272,11 @@ try {
     const prodottiVerificati = verificato.prodotti;
     const totaleVerificato = verificato.totale;
     if (metodoPagamento === "locale" && !verificato.settings.pagamentoLocaleAttivo) {
-  return res.status(403).json({ error: "pagamento_locale_non_disponibile" });
-}
-
+      return res.status(403).json({ error: "pagamento_locale_non_disponibile" });
+    }
+ 
     let pagamentoVerificato = false;
+    let intentDaMarcare = null;
     if (metodoPagamento === "Paga con carta") {
       if (!stripePaymentIntentId) {
         console.error("❌ carta: stripePaymentIntentId mancante nel body");
@@ -1279,18 +1293,29 @@ try {
           console.error("⚠️ Importo Stripe non corrisponde:", intent.amount, "atteso:", importoAtteso);
           return res.status(402).json({ error: "Importo pagamento non corrispondente" });
         }
+        // ✅ NUOVO: il pagamento deve essere stato creato per questo locale e da questo utente
+        if (intent.metadata?.localeId !== localeId || intent.metadata?.uid !== decoded.uid) {
+          console.error("⚠️ PaymentIntent di un altro locale/utente:", stripePaymentIntentId);
+          return res.status(402).json({ error: "Pagamento non valido per questo ordine" });
+        }
+        // ✅ NUOVO: un pagamento = un ordine
+        if (intent.metadata?.usato === "1") {
+          console.error("⚠️ PaymentIntent già usato:", stripePaymentIntentId);
+          return res.status(409).json({ error: "pagamento_gia_usato" });
+        }
         pagamentoVerificato = true;
+        intentDaMarcare = intent;
       } catch (stripeErr) {
         console.error("❌ Errore verifica Stripe:", stripeErr.message, "id ricevuto:", stripePaymentIntentId);
         return res.status(402).json({ error: "Errore verifica pagamento Stripe" });
       }
     }
-
+ 
     let tavoloRisolto = tavolo || "";
     let noteCliente = null;
     let daVerificare = false;
     let spam = false;
-
+ 
     if (tableId != null) {
       noteCliente = tavolo || null;
       try {
@@ -1298,7 +1323,7 @@ try {
           .collection("bars").doc(localeId)
           .collection("sessioniTavolo").doc(String(tableId))
           .get();
-
+ 
         let sessioneValida = false;
         if (sessioneSnap.exists) {
           const sessione = sessioneSnap.data();
@@ -1308,7 +1333,7 @@ try {
             sessione.token === sessionToken &&
             (sessione.scadeAt == null || sessione.scadeAt > ora);
         }
-
+ 
         if (!sessioneValida) {
           spam = true;
         } else {
@@ -1316,7 +1341,7 @@ try {
             .collection("bars").doc(localeId)
             .collection("meta").doc("locale")
             .get();
-
+ 
           if (localeSnap.exists) {
             const localeData = localeSnap.data();
             if (
@@ -1331,7 +1356,7 @@ try {
             }
           }
         }
-
+ 
         const tavoloSnap = await demasDb
           .collection("bars").doc(localeId)
           .collection("tavoli").doc(String(tableId))
@@ -1344,8 +1369,8 @@ try {
         daVerificare = true;
       }
     }
-
- const now = new Date();
+ 
+    const now = new Date();
     const formatter = new Intl.DateTimeFormat("it-IT", {
       timeZone: "Europe/Rome", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
     });
@@ -1354,56 +1379,46 @@ try {
     const ordineId = `${get("day")}-${get("month")}_${get("hour")}-${get("minute")}_${
       String(decoded.email || "utente").replace(/[@.]/g, "-").slice(0, 40)
     }_${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-
+ 
     // ⛔ Sessione non valida → blocca PRIMA di scrivere l'ordine
     if (spam) {
       return res.status(409).json({ error: "sessione_non_valida", scollega: true });
     }
-
+ 
     // ── Risolvi cliente preferito (query mirate, niente full scan) ──
     const emailNorm = String(decoded.email || "").trim().toLowerCase();
     const telNorm = String(userData.phone || "").trim();
-    // opzionale: se in futuro il client lo manda nel body
     const clientePreferitoIdBody =
       typeof req.body.clientePreferitoId === "string" && req.body.clientePreferitoId.trim()
         ? req.body.clientePreferitoId.trim()
         : null;
-
+ 
     let clientePreferitoId = null;
     try {
       const preferitiCol = demasDb
         .collection("bars")
         .doc(localeId)
-        .collection("clientiPreferiti"); // ← verifica nome collection in useClientiPreferiti
-
-      // 1) ID esplicito dal client (se presente e valido per questo locale)
+        .collection("clientiPreferiti");
+ 
       if (clientePreferitoIdBody) {
         const snap = await preferitiCol.doc(clientePreferitoIdBody).get();
         if (snap.exists) clientePreferitoId = snap.id;
       }
-
-      // 2) Match per email (caso più comune per utenti app autenticati)
+ 
       if (!clientePreferitoId && emailNorm) {
-        const byEmail = await preferitiCol
-          .where("email", "==", emailNorm)
-          .limit(1)
-          .get();
+        const byEmail = await preferitiCol.where("email", "==", emailNorm).limit(1).get();
         if (!byEmail.empty) clientePreferitoId = byEmail.docs[0].id;
       }
-
-      // 3) Fallback telefono
+ 
       if (!clientePreferitoId && telNorm) {
-        const byTel = await preferitiCol
-          .where("telefono", "==", telNorm)
-          .limit(1)
-          .get();
+        const byTel = await preferitiCol.where("telefono", "==", telNorm).limit(1).get();
         if (!byTel.empty) clientePreferitoId = byTel.docs[0].id;
       }
     } catch (e) {
       console.error("lookup clientePreferito:", e);
       // non bloccare l'ordine se il lookup fallisce
     }
-
+ 
     await demasDb
       .collection("bars")
       .doc(localeId)
@@ -1412,12 +1427,12 @@ try {
       .set({
         cliente: {
           uid: decoded.uid,
-          id: clientePreferitoId, // allinea a ciò che legge ListaOrdini
+          id: clientePreferitoId,
           email: String(decoded.email || "").slice(0, 120),
           nome: String(guestName || userData.ownerName || "").slice(0, 80),
           telefono: String(userData.phone || "").slice(0, 30),
         },
-        clientePreferitoId: clientePreferitoId, // ← chiave usata da ListaOrdini
+        clientePreferitoId: clientePreferitoId,
         tavolo: tavoloRisolto,
         note: note || noteCliente || null,
         tableId: tableId ?? null,
@@ -1433,11 +1448,22 @@ try {
         status: "nuovo",
         source: "appbase",
       });
-
-    res.json({ success: true });  
+ 
+    // ✅ NUOVO: segna il pagamento come usato (best effort: l'ordine è già salvato, un errore qui non lo annulla)
+    if (intentDaMarcare) {
+      try {
+        await stripe.paymentIntents.update(intentDaMarcare.id, {
+          metadata: { ...intentDaMarcare.metadata, usato: "1", ordineId },
+        });
+      } catch (e) {
+        console.error("⚠️ Impossibile marcare il PaymentIntent come usato:", intentDaMarcare.id, e.message);
+      }
+    }
+ 
+    res.json({ success: true });
   } catch (err) {
-    console.error(err);
-    return res.status(403).json({ error: "token non valido" });
+    console.error("❌ send-order:", err);
+    return res.status(500).json({ error: "errore_server" });
   }
 });
 
