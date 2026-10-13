@@ -1878,8 +1878,17 @@ const risultato = await stripe.subscriptions.update(info.stripeSubscriptionId, {
   items: [{ id: itemId, price: stripePriceId }],
   proration_behavior: "always_invoice",
   payment_behavior: "pending_if_incomplete",
-    billing_cycle_anchor: "now",
+  billing_cycle_anchor: "now",
+  cancel_at_period_end: false, // <-- Fondamentale: sblocca e annulla la disdetta in corso
   metadata: { barId, planId, ciclo: cicloScelto },
+});
+
+// Aggiorna subito anche Firestore per riflettere il cambio nel frontend
+await infoRef.update({
+  "piano.tipo": planId,
+  "piano.ciclo": cicloScelto,
+  "piano.cancellazionePendente": false,
+  "piano.cancellaIl": null,
 });
 
 if (risultato.pending_update) {
