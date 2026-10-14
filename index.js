@@ -162,8 +162,45 @@ case "customer.subscription.deleted": {
   const mappaSnap = await demasDb.collection("stripeCustomerMap").doc(customerId).get();
   if (mappaSnap.exists) {
     const barId = mappaSnap.data().barId;
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const barData = (await infoRef.get()).data() || {};
+
+    // Se il locale ha già una subscription più recente, questo evento riguarda
+    // quella vecchia: non dobbiamo riportarlo a Free.
+    if (barData.stripeSubscriptionId && barData.stripeSubscriptionId !== subscription.id) break;
+
     await demasDb.collection("overduePayments").doc(barId).delete().catch(() => {});
     await applyPlanToBar(barId, "freeplan", "stripe-webhook-cancellation", "mensile", true);
+    await infoRef.update({
+      stripeSubscriptionId: admin.firestore.FieldValue.delete(),
+      "piano.pagamentoInSospeso": admin.firestore.FieldValue.delete(),
+      "piano.pagamentoScaduto": admin.firestore.FieldValue.delete(),
+      "piano.rinnovoIl": admin.firestore.FieldValue.delete(),
+    });
+  }
+  break;
+}
+
+case "customer.deleted": {
+  const customer = event.data.object;
+  const mappaSnap = await demasDb.collection("stripeCustomerMap").doc(customer.id).get();
+  if (mappaSnap.exists) {
+    const barId = mappaSnap.data().barId;
+    const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
+    const barData = (await infoRef.get()).data() || {};
+
+    if (barData.stripeCustomerId === customer.id) {
+      await demasDb.collection("overduePayments").doc(barId).delete().catch(() => {});
+      await applyPlanToBar(barId, "freeplan", "stripe-customer-deleted", "mensile", true);
+      await infoRef.update({
+        stripeCustomerId: admin.firestore.FieldValue.delete(),
+        stripeSubscriptionId: admin.firestore.FieldValue.delete(),
+        "piano.pagamentoInSospeso": admin.firestore.FieldValue.delete(),
+        "piano.pagamentoScaduto": admin.firestore.FieldValue.delete(),
+        "piano.rinnovoIl": admin.firestore.FieldValue.delete(),
+      });
+    }
+    await mappaSnap.ref.delete().catch(() => {});
   }
   break;
 }
@@ -1121,7 +1158,8 @@ app.post("/billing/sync-plan", async (req, res) => {
     if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
     if (!info.stripeSubscriptionId) return res.status(400).json({ error: "Nessun abbonamento da sincronizzare" });
 
-    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    const subscription = await getSubscriptionViva(infoRef, info);
+    if (!subscription) return res.status(409).json(ERRORE_NESSUN_ABBONAMENTO);
     const priceId = subscription.items?.data?.[0]?.price?.id;
 
     if (subscription.status === "active" && priceId) {
@@ -1639,6 +1677,61 @@ function isStripeTaxLocationError(err) {
     /customer.*address/i.test(err?.message || "")
   );
 }
+/**
+ * Recupera la subscription Stripe del locale e verifica che sia DAVVERO viva.
+ * Se è cancellata / scaduta / inesistente (es. customer eliminato a mano dalla
+ * dashboard Stripe) ripulisce i riferimenti stantii su Firestore e ritorna null.
+ * soloPagata=true: una subscription "incomplete" (pagamento mai completato)
+ * non conta come abbonamento su cui fare cambio piano (ma non viene pulita).
+ */
+const STATI_SUB_TERMINATI = ["canceled", "incomplete_expired"];
+async function getSubscriptionViva(infoRef, info, { soloPagata = false } = {}) {
+  if (!info.stripeSubscriptionId) return null;
+  const sub = await stripe.subscriptions.retrieve(info.stripeSubscriptionId).catch(() => null);
+
+  if (!sub || STATI_SUB_TERMINATI.includes(sub.status)) {
+    await infoRef.update({
+      stripeSubscriptionId: admin.firestore.FieldValue.delete(),
+      "piano.pagamentoInSospeso": admin.firestore.FieldValue.delete(),
+      "piano.pagamentoScaduto": admin.firestore.FieldValue.delete(),
+      "piano.rinnovoIl": admin.firestore.FieldValue.delete(),
+      "piano.cancellazionePendente": false,
+      "piano.cancellaIl": null,
+    });
+    return null;
+  }
+  if (soloPagata && sub.status === "incomplete") return null;
+  return sub;
+}
+
+const ERRORE_NESSUN_ABBONAMENTO = {
+  error: "abbonamento_non_attivo",
+  message: "Nessun abbonamento attivo su Stripe per questo locale.",
+};
+
+/**
+ * Restituisce un customer Stripe VALIDO per il locale. Se quello salvato su
+ * Firestore non esiste più o è stato eliminato (deleted:true), ne crea uno nuovo
+ * e aggiorna Firestore + stripeCustomerMap.
+ */
+async function getOrCreateStripeCustomer(infoRef, info, barId) {
+  if (info.stripeCustomerId) {
+    const esistente = await stripe.customers.retrieve(info.stripeCustomerId).catch(() => null);
+    if (esistente && !esistente.deleted) return esistente.id;
+
+    await demasDb.collection("stripeCustomerMap").doc(info.stripeCustomerId).delete().catch(() => {});
+    await infoRef.update({ stripeCustomerId: admin.firestore.FieldValue.delete() });
+  }
+  const customer = await stripe.customers.create({
+    email: info.email || undefined,
+    name: info.companyName || undefined,
+    metadata: { barId },
+  });
+  await infoRef.update({ stripeCustomerId: customer.id });
+  await demasDb.collection("stripeCustomerMap").doc(customer.id).set({ barId }, { merge: true });
+  return customer.id;
+}
+
 /* =========================
    BILLING — PAYMENT SHEET (primo acquisto, nativo Capacitor)
    POST /billing/create-payment-sheet
@@ -1692,7 +1785,10 @@ app.post("/billing/create-payment-sheet", async (req, res) => {
       }
 
       // canceled / incomplete_expired / non trovata su Stripe: liberiamo il riferimento
-      await infoRef.update({ stripeSubscriptionId: admin.firestore.FieldValue.delete() });
+      await infoRef.update({
+        stripeSubscriptionId: admin.firestore.FieldValue.delete(),
+        "piano.pagamentoInSospeso": admin.firestore.FieldValue.delete(),
+      });
     }
 
 let planDoc;
@@ -1706,19 +1802,9 @@ const plan = planDoc.data;
     const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
     if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
 
-   let stripeCustomerId = info.stripeCustomerId;
-if (!stripeCustomerId) {
-  const customer = await stripe.customers.create({
-    email: info.email || undefined,
-    name: info.companyName || undefined,
-    metadata: { barId },
-  });
-  stripeCustomerId = customer.id;
-  await infoRef.update({ stripeCustomerId });
-}
-// Mappa diretta customerId → barId: elimina il bisogno di query collectionGroup
-// (e quindi di indici) ovunque nel webhook.
-await demasDb.collection("stripeCustomerMap").doc(stripeCustomerId).set({ barId }, { merge: true });
+    // Se il customer salvato è stato eliminato su Stripe, ne viene creato uno nuovo
+    // (e aggiornata anche la mappa customerId → barId usata dal webhook).
+    const stripeCustomerId = await getOrCreateStripeCustomer(infoRef, info, barId);
 
     if (indirizzo?.country && indirizzo?.postal_code) {
       await stripe.customers.update(stripeCustomerId, {
@@ -1897,7 +1983,8 @@ const plan = planDoc.data;
 
 // Verifica coerenza subscription: se ha più di un item, qualcosa non va —
     // meglio bloccare con un errore chiaro che riprorazionare dati sporchi.
-    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    const subscription = await getSubscriptionViva(infoRef, info, { soloPagata: true });
+    if (!subscription) return res.status(409).json(ERRORE_NESSUN_ABBONAMENTO);
     if (subscription.items.data.length !== 1) {
       return res.status(409).json({
         error: "Abbonamento in stato inconsistente (più voci attive). Contatta l'assistenza prima di procedere.",
@@ -1935,14 +2022,6 @@ const risultato = await stripe.subscriptions.update(info.stripeSubscriptionId, {
   metadata: { barId, planId, ciclo: cicloScelto },
 });
 
-// Aggiorna subito anche Firestore per riflettere il cambio nel frontend
-await infoRef.update({
-  "piano.tipo": planId,
-  "piano.ciclo": cicloScelto,
-  "piano.cancellazionePendente": false,
-  "piano.cancellaIl": null,
-});
-
 if (risultato.pending_update) {
   // Il pagamento non è riuscito immediatamente: Stripe riproverà automaticamente.
   // Il piano NON è ancora cambiato — resta quello attuale finché il pagamento non si conclude.
@@ -1952,10 +2031,10 @@ if (risultato.pending_update) {
   });
 }
 
+// Pagamento riuscito: applichiamo subito piano + zoneConfig (stessa funzione del
+// webhook, quindi niente stato a metà) e azzeriamo l'eventuale disdetta pendente.
+await applyPlanToBar(barId, planId, "change-plan", cicloScelto, true);
 res.json({ success: true });
-    // L'applicazione vera e propria (piano + zoneConfig) arriva dal webhook
-    // customer.subscription.updated — non scriviamo Firestore qui per evitare
-    // di bypassare il ricalcolo di zoneConfig fatto da applyPlanToBar.
 } catch (err) {
     console.error("❌ Errore change-plan:", err);
     if (isStripeTaxLocationError(err)) {
@@ -2002,7 +2081,8 @@ const plan = planDoc.data;
 
     // Verifica coerenza subscription: se ha più di un item, qualcosa non va —
     // meglio bloccare con un errore chiaro che riprorazionare dati sporchi.
-    const subscription = await stripe.subscriptions.retrieve(info.stripeSubscriptionId);
+    const subscription = await getSubscriptionViva(infoRef, info, { soloPagata: true });
+    if (!subscription) return res.status(409).json(ERRORE_NESSUN_ABBONAMENTO);
     if (subscription.items.data.length !== 1) {
       return res.status(409).json({
         error: "Abbonamento in stato inconsistente (più voci attive). Contatta l'assistenza prima di procedere.",
@@ -2097,6 +2177,9 @@ app.post("/billing/cancel-subscription", async (req, res) => {
     const info = infoSnap.data();
     if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
     if (!info.stripeSubscriptionId) return res.status(400).json({ error: "Nessun abbonamento attivo" });
+
+    const viva = await getSubscriptionViva(infoRef, info);
+    if (!viva) return res.status(409).json(ERRORE_NESSUN_ABBONAMENTO);
 
     const subscription = await stripe.subscriptions.update(info.stripeSubscriptionId, {
       cancel_at_period_end: true,
@@ -2208,6 +2291,9 @@ app.post("/billing/resume-subscription", async (req, res) => {
     const info = infoSnap.data();
     if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
     if (!info.stripeSubscriptionId) return res.status(400).json({ error: "Nessun abbonamento attivo" });
+
+    const viva = await getSubscriptionViva(infoRef, info);
+    if (!viva) return res.status(409).json(ERRORE_NESSUN_ABBONAMENTO);
 
     await stripe.subscriptions.update(info.stripeSubscriptionId, { cancel_at_period_end: false });
 
