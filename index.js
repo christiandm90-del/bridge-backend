@@ -1504,10 +1504,48 @@ app.get("/resolve-table/:token", async (req, res) => {
 /* =========================
    BILLING — HELPER
 ========================= */
+async function getPlanDoc(planId, barId = null) {
+  // 1. Catalogo generale
+  const publicSnap = await demasDb.collection("plans").doc(planId).get();
+  if (publicSnap.exists) {
+    return { id: publicSnap.id, data: publicSnap.data(), isCustom: false };
+  }
+
+  // 2. Piani personalizzati
+  const customSnap = await demasDb.collection("customPlans").doc(planId).get();
+  if (!customSnap.exists) return null;
+
+  const data = customSnap.data();
+  // Sicurezza: se conosciamo il bar, deve essere nell'elenco assegnati
+  if (barId) {
+    const assigned = Array.isArray(data.assignedBarIds) ? data.assignedBarIds : [];
+    if (!assigned.includes(barId)) {
+      const err = new Error("Questo piano personalizzato non è assegnato a questo locale");
+      err.status = 403;
+      throw err;
+    }
+    // Scadenza visibilità (opzionale ma coerente con il frontend)
+    const exp = data.expirationByBar?.[barId];
+    if (exp) {
+      const expMs = exp.toMillis ? exp.toMillis() : new Date(exp).getTime();
+      if (expMs < Date.now()) {
+        const err = new Error("Questo piano personalizzato è scaduto per il tuo locale");
+        err.status = 410;
+        throw err;
+      }
+    }
+  }
+
+  return { id: customSnap.id, data, isCustom: true };
+}
+
+/**
+ * Applica i limiti e i permessi di un piano (generale o custom) al locale.
+ */
 async function applyPlanToBar(barId, planId, source, ciclo = "mensile", resetCancellazione = false) {
-  const planSnap = await demasDb.collection("plans").doc(planId).get();
-  if (!planSnap.exists) throw new Error(`Piano "${planId}" non trovato in /plans`);
-  const plan = planSnap.data();
+  const trovato = await getPlanDoc(planId, barId);
+  if (!trovato) throw new Error(`Piano "${planId}" non trovato in /plans né in /customPlans`);
+  const plan = trovato.data;
 
   const infoRef = demasDb.collection("bars").doc(barId).collection("meta").doc("info");
   const infoSnap = await infoRef.get();
@@ -1517,42 +1555,46 @@ async function applyPlanToBar(barId, planId, source, ciclo = "mensile", resetCan
   const employees = Array.isArray(info.employees) ? info.employees : [];
   const permissions = {};
   employees.forEach((emp) => {
-    if (emp?.id) permissions[emp.id] = { ...plan.permissionsDefault };
+    if (emp?.id) permissions[emp.id] = { ...(plan.permissionsDefault || {}) };
   });
 
   const aggiornamento = {
     "piano.tipo": planId,
     "piano.ciclo": ciclo,
-    "piano.personalizzato": false,
+    "piano.personalizzato": !!trovato.isCustom,
     "piano.aggiornatoDa": source,
     "piano.aggiornatoIl": admin.firestore.FieldValue.serverTimestamp(),
     zoneConfig: {
-      limits: plan.limits,
+      limits: plan.limits || {},
       permissions,
     },
   };
 
-  // Solo su cancellazione REALE (subscription eliminata) azzeriamo lo stato
-  // di disdetta — altrimenti, se il piano viene semplicemente riapplicato
-  // per un evento non correlato (es. toggle cancel_at_period_end), non deve
-  // toccare questi campi.
   if (resetCancellazione) {
     aggiornamento["piano.cancellazionePendente"] = false;
     aggiornamento["piano.cancellaIl"] = null;
   }
 
   await infoRef.update(aggiornamento);
-
-  console.log(`✅ Piano di ${barId} aggiornato a "${planId}" (${ciclo}, ${source})`);
+  console.log(`✅ Piano di ${barId} aggiornato a "${planId}" (${ciclo}, custom=${trovato.isCustom}, ${source})`);
 }
+
 
 // Cerca un piano per price id, sia mensile che annuale, e restituisce anche il ciclo trovato
 async function findPlanByStripePriceId(priceId) {
-  const snapMensile = await demasDb.collection("plans").where("stripePriceIdMensile", "==", priceId).limit(1).get();
-  if (!snapMensile.empty) return { planId: snapMensile.docs[0].id, ciclo: "mensile" };
+  // --- piani generali ---
+  let snap = await demasDb.collection("plans").where("stripePriceIdMensile", "==", priceId).limit(1).get();
+  if (!snap.empty) return { planId: snap.docs[0].id, ciclo: "mensile", isCustom: false };
 
-  const snapAnnuale = await demasDb.collection("plans").where("stripePriceIdAnnuale", "==", priceId).limit(1).get();
-  if (!snapAnnuale.empty) return { planId: snapAnnuale.docs[0].id, ciclo: "annuale" };
+  snap = await demasDb.collection("plans").where("stripePriceIdAnnuale", "==", priceId).limit(1).get();
+  if (!snap.empty) return { planId: snap.docs[0].id, ciclo: "annuale", isCustom: false };
+
+  // --- piani personalizzati ---
+  snap = await demasDb.collection("customPlans").where("stripePriceIdMensile", "==", priceId).limit(1).get();
+  if (!snap.empty) return { planId: snap.docs[0].id, ciclo: "mensile", isCustom: true };
+
+  snap = await demasDb.collection("customPlans").where("stripePriceIdAnnuale", "==", priceId).limit(1).get();
+  if (!snap.empty) return { planId: snap.docs[0].id, ciclo: "annuale", isCustom: true };
 
   return null;
 }
@@ -1653,9 +1695,14 @@ app.post("/billing/create-payment-sheet", async (req, res) => {
       await infoRef.update({ stripeSubscriptionId: admin.firestore.FieldValue.delete() });
     }
 
-    const planSnap = await demasDb.collection("plans").doc(planId).get();
-    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
-    const plan = planSnap.data();
+let planDoc;
+try {
+  planDoc = await getPlanDoc(planId, barId);
+} catch (e) {
+  return res.status(e.status || 500).json({ error: e.message });
+}
+if (!planDoc) return res.status(404).json({ error: "Piano non trovato" });
+const plan = planDoc.data;
     const stripePriceId = cicloScelto === "annuale" ? plan.stripePriceIdAnnuale : plan.stripePriceIdMensile;
     if (!stripePriceId) return res.status(400).json({ error: "Piano non acquistabile online per questo ciclo" });
 
@@ -1839,9 +1886,14 @@ app.post("/billing/change-plan", async (req, res) => {
       return res.status(400).json({ error: "Nessun abbonamento attivo — usa create-checkout-session" });
     }
 
-    const planSnap = await demasDb.collection("plans").doc(planId).get();
-    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
-    const plan = planSnap.data();
+let planDoc;
+try {
+  planDoc = await getPlanDoc(planId, barId);
+} catch (e) {
+  return res.status(e.status || 500).json({ error: e.message });
+}
+if (!planDoc) return res.status(404).json({ error: "Piano non trovato" });
+const plan = planDoc.data;
 
 // Verifica coerenza subscription: se ha più di un item, qualcosa non va —
     // meglio bloccare con un errore chiaro che riprorazionare dati sporchi.
@@ -1859,8 +1911,8 @@ app.post("/billing/change-plan", async (req, res) => {
       return res.status(409).json({ error: "Piano attuale non riconosciuto nel catalogo." });
     }
 
-    const planAttualeSnap = await demasDb.collection("plans").doc(pianoAttualeTrovato.planId).get();
-    const livelloAttuale = planAttualeSnap.data()?.livello ?? 0;
+  const planAttualeDoc = await getPlanDoc(pianoAttualeTrovato.planId);
+const livelloAttuale = planAttualeDoc?.data?.livello ?? 0;
     const livelloTarget = plan.livello ?? 0;
 
     const check = transizioneConsentita(livelloAttuale, pianoAttualeTrovato.ciclo, livelloTarget, cicloScelto);
@@ -1939,9 +1991,14 @@ app.post("/billing/preview-plan-change", async (req, res) => {
     if (info.uid !== decoded.uid) return res.status(403).json({ error: "Non autorizzato su questo locale" });
     if (!info.stripeSubscriptionId) return res.status(400).json({ error: "Nessun abbonamento attivo" });
 
-    const planSnap = await demasDb.collection("plans").doc(planId).get();
-    if (!planSnap.exists) return res.status(404).json({ error: "Piano non trovato" });
-    const plan = planSnap.data();
+let planDoc;
+try {
+  planDoc = await getPlanDoc(planId, barId);
+} catch (e) {
+  return res.status(e.status || 500).json({ error: e.message });
+}
+if (!planDoc) return res.status(404).json({ error: "Piano non trovato" });
+const plan = planDoc.data;
 
     // Verifica coerenza subscription: se ha più di un item, qualcosa non va —
     // meglio bloccare con un errore chiaro che riprorazionare dati sporchi.
@@ -1959,8 +2016,8 @@ app.post("/billing/preview-plan-change", async (req, res) => {
       return res.status(409).json({ error: "Piano attuale non riconosciuto nel catalogo." });
     }
 
-    const planAttualeSnap = await demasDb.collection("plans").doc(pianoAttualeTrovato.planId).get();
-    const livelloAttuale = planAttualeSnap.data()?.livello ?? 0;
+const planAttualeDoc = await getPlanDoc(pianoAttualeTrovato.planId);
+const livelloAttuale = planAttualeDoc?.data?.livello ?? 0;
     const livelloTarget = plan.livello ?? 0;
 
     const check = transizioneConsentita(livelloAttuale, pianoAttualeTrovato.ciclo, livelloTarget, cicloScelto);
