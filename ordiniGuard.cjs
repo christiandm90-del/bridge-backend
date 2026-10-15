@@ -16,14 +16,14 @@ var __copyProps = (to, from, except, desc) => {
 };
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
-// ../../../../../home/claude/out/ordiniGuard.ts
+// ordiniGuard.ts
 var ordiniGuard_exports = {};
 __export(ordiniGuard_exports, {
   creaOrdiniGuard: () => creaOrdiniGuard
 });
 module.exports = __toCommonJS(ordiniGuard_exports);
 
-// ../../../../../home/claude/out/infoLocaleUtils.ts
+// infoLocaleUtils.ts
 var MAX_TURNI = 2;
 var FUSO_ORARIO = "Europe/Rome";
 var giorni = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"];
@@ -200,7 +200,7 @@ function getStatoOrdini(data, adesso = adessoRoma(), ora = Date.now()) {
   return { stato: "aperto" };
 }
 
-// ../../../../../home/claude/out/ordiniGuard.ts
+// ordiniGuard.ts
 var TTL = { pubblicato: 15e3, piano: 6e4, catalogoPiani: 6e5, bloccati: 6e4 };
 var MAX_ENTRIES = 500;
 function cached(map, key, ttl, load) {
@@ -293,13 +293,22 @@ function creaOrdiniGuard({ demasDb, appbaseDb }) {
       chiusurePeriodo: pm.chiusurePeriodo || null,
       chiusureDate,
       chiusurePeriodi,
-      offerte: pm.offerte || [],
+      offerte: pm.menuVisualizzazione === "testo" ? (pm.offerte || []).map((o2) => ({ ...o2, immagine: null, immagineOriginale: null })) : pm.offerte || [],
+      menuVisualizzazione: pm.menuVisualizzazione === "testo" ? "testo" : "immagini",
       menuPubblicoAttivo: pm.menuPubblicoAttivo || false,
       pagamentoLocaleAttivo: pm.pagamentoLocaleAttivo !== false,
       ordini
     };
   }
-  return { verificaOrdiniConsentiti, pianoConsenteOrdini, campiPubbliciDaSync, invalida };
+  function pulisciPerModalita(updateData) {
+    if (updateData?.menuVisualizzazione !== "testo") return updateData;
+    const senza = (arr) => Array.isArray(arr) ? arr.map((x) => ({ ...x, immagine: null, immagineOriginale: null })) : arr;
+    updateData.categorie = senza(updateData.categorie);
+    updateData.sottocategorie = senza(updateData.sottocategorie);
+    updateData.prodotti = senza(updateData.prodotti);
+    return updateData;
+  }
+  return { verificaOrdiniConsentiti, pianoConsenteOrdini, campiPubbliciDaSync, pulisciPerModalita, invalida };
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {

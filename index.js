@@ -1019,6 +1019,7 @@ app.post("/sync-menu", async (req, res) => {
       ordiniGuard.invalida(localeId);
       const ordiniConsentiti = await ordiniGuard.pianoConsenteOrdini(localeId);
       Object.assign(updateData, ordiniGuard.campiPubbliciDaSync(publicMenus, ordiniConsentiti));
+      ordiniGuard.pulisciPerModalita(updateData); // menu "solo testo": non pubblica gli URL delle immagini
  
       // Salvataggio delivery completa (invariato)
       if (publicMenus.delivery) {
@@ -1038,7 +1039,6 @@ app.post("/sync-menu", async (req, res) => {
     res.status(500).json({ error: "server error" });
   }
 });
- 
  
 /* =========================
    HELPER: distanza in metri (haversine)
